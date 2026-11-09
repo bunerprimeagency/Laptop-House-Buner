@@ -1362,6 +1362,880 @@ def reports():
 
 
 # ==================================================================
+# INCOME & EXPENSE MANAGEMENT (ADMIN ONLY)
+# ==================================================================
+INCOME_CATEGORIES = ["Laptop Sales Payments", "Accessories Sales", "Repairing Income",
+                     "Software Installation Income", "Other Services Income", "Other Business Income"]
+EXPENSE_CATEGORIES = ["Shop Rent", "Electricity Bill", "Internet Bill", "Staff Salaries", "Transportation / Fuel",
+                      "Laptop Purchasing", "Accessories Purchasing", "Repairing / Maintenance",
+                      "Marketing / Advertising", "Office Supplies", "Food / Tea", "Taxes / Government Fees",
+                      "Other Expenses"]
+# Buying stock is tracked separately: the cost of products actually SOLD (COGS) is what reduces profit.
+INVENTORY_EXPENSE_CATEGORIES = ("Laptop Purchasing", "Accessories Purchasing")
+FIN_METHODS = ["Cash", "Bank", "JazzCash", "EasyPaisa", "Other"]
+FIN_PERIODS = ["Today", "Yesterday", "This Week", "This Month", "Last Month", "Custom Date Range", "All Time"]
+ALL_TIME_START = date(2000, 1, 1)
+
+FIN_CFG = {
+    "income": {"table": "business_income", "title": "income_title", "date": "income_date", "party": "received_from",
+               "cats": INCOME_CATEGORIES, "title_label": "Income Title", "party_label": "Received From",
+               "ref_label": "Reference / Invoice Number"},
+    "expense": {"table": "business_expenses", "title": "expense_title", "date": "expense_date", "party": "paid_to",
+                "cats": EXPENSE_CATEGORIES, "title_label": "Expense Title", "party_label": "Paid To",
+                "ref_label": "Receipt / Reference Number"},
+}
+
+FIN_SQL = """create table if not exists business_income (
+  id bigint generated always as identity primary key,
+  income_title text not null,
+  category text not null,
+  amount numeric(14,2) not null check (amount > 0),
+  payment_method text not null default 'Cash'
+    check (payment_method in ('Cash','Bank','JazzCash','EasyPaisa','Other')),
+  income_date date not null default current_date,
+  received_from text,
+  description text,
+  reference_no text,
+  created_by text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index if not exists idx_business_income_date on business_income (income_date);
+
+create table if not exists business_expenses (
+  id bigint generated always as identity primary key,
+  expense_title text not null,
+  category text not null,
+  amount numeric(14,2) not null check (amount > 0),
+  payment_method text not null default 'Cash'
+    check (payment_method in ('Cash','Bank','JazzCash','EasyPaisa','Other')),
+  expense_date date not null default current_date,
+  paid_to text,
+  description text,
+  reference_no text,
+  created_by text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index if not exists idx_business_expenses_date on business_expenses (expense_date);
+
+alter table business_income enable row level security;
+alter table business_expenses enable row level security;"""
+
+
+# ---------------- backend: permissions + database writes ----------------
+def fin_tables_ok():
+    return col_exists("business_income", "id") and col_exists("business_expenses", "id")
+
+
+def load_fin_data():
+    require_admin()
+    raw = {n: get_data(n) for n in ("products", "sales", "sale_items", "payments")}
+    for key, table in (("income", "business_income"), ("expenses", "business_expenses")):
+        raw[key] = get_data(table) if col_exists(table, "id") else []
+    return raw
+
+
+def fin_insert(kind, vals):
+    require_admin()
+    data = dict(vals)
+    data["created_by"] = current_username()
+    supabase.table(FIN_CFG[kind]["table"]).insert(data).execute()
+
+
+def fin_update(kind, row_id, vals):
+    require_admin()
+    data = dict(vals)
+    data["updated_at"] = datetime.now(timezone.utc).isoformat()
+    done = supabase.table(FIN_CFG[kind]["table"]).update(data).eq("id", row_id).execute().data
+    if not done:
+        raise ValueError("Record not found. It may have been deleted.")
+
+
+def fin_delete(kind, row_id):
+    require_admin()
+    supabase.table(FIN_CFG[kind]["table"]).delete().eq("id", row_id).execute()
+
+
+def fin_validate(kind, vals, ctx):
+    cfg = FIN_CFG[kind]
+    if not vals[cfg["title"]]:
+        return f"{cfg['title_label']} is required."
+    if vals["amount"] <= 0:
+        return "Amount must be greater than zero."
+    if vals["amount"] > 1_000_000_000:
+        return "Amount is too large. Please check it."
+    d = parse_date(vals[cfg["date"]])
+    if d is None or d > today_pk():
+        return "The date cannot be in the future."
+    if kind == "income" and vals["reference_no"] and vals["reference_no"].strip().lower() in ctx["invoice_nos"]:
+        return ("This reference is an existing invoice. Customer payments for billing invoices are included "
+                "automatically (use Sales History → Receive Payment). Recording it here would count the money twice.")
+    return None
+
+
+def fin_is_duplicate(kind, vals):
+    cfg = FIN_CFG[kind]
+    fp = (kind, vals[cfg["title"]].lower(), round(vals["amount"], 2), vals[cfg["date"]], vals["category"])
+    last = st.session_state.get("fin_last_fp")
+    return bool(last and last[0] == fp and (datetime.now() - last[1]).total_seconds() < 60), fp
+
+
+# ---------------- calculations ----------------
+def method_from_note(note):
+    text = str(note or "")
+    for m in PAYMENT_METHODS:
+        if f"({m})" in text:
+            return {"Bank Transfer": "Bank", "Card": "Bank"}.get(m, m)
+    return "Unspecified"
+
+
+def payment_date(p, sale):
+    v = p.get("created_at")
+    if v:
+        try:
+            dt = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+            if dt.tzinfo:
+                dt = dt.astimezone(timezone(timedelta(hours=5)))
+            return dt.date()
+        except Exception:
+            d = parse_date(v)
+            if d:
+                return d
+    return parse_date(sale.get("sale_date"))
+
+
+def build_fin_context(raw):
+    """Turns raw tables into one clean ledger. Each customer payment is counted exactly once."""
+    sales = raw["sales"]
+    active = active_sales(sales)
+    sale_by_id = {s["id"]: s for s in sales}
+    prod_by_id = {p["id"]: p for p in raw["products"]}
+    items_by_sale, cost_by_sale = {}, {}
+    for i in raw["sale_items"]:
+        sid = i.get("sale_id")
+        items_by_sale.setdefault(sid, []).append(i)
+        cost_by_sale[sid] = cost_by_sale.get(sid, 0) + num(i.get("purchase_price")) * num(i.get("quantity"))
+
+    income, pay_sum = [], {}
+    for p in raw["payments"]:
+        s = sale_by_id.get(p.get("sale_id"))
+        if not s or sale_status(s) == "cancelled":
+            continue  # payments of cancelled invoices are treated as refunded
+        amt = num(p.get("amount"))
+        pay_sum[s["id"]] = pay_sum.get(s["id"], 0) + amt
+        its = items_by_sale.get(s["id"], [])
+        prod = prod_by_id.get(its[0].get("product_id")) if its else None
+        cat = "Accessories Sales" if prod and str(prod.get("category", "")).lower() == "accessories" else "Laptop Sales Payments"
+        income.append({"id": None, "kind": "sales", "date": payment_date(p, s), "source": "Sales payment (auto)",
+                       "title": f"Payment for {s.get('invoice_no')}", "category": cat, "amount": amt,
+                       "method": method_from_note(p.get("note")), "party": s.get("customer_name") or "",
+                       "reference": s.get("invoice_no") or "", "by": p.get("received_by") or ""})
+    raw_income = {r["id"]: r for r in raw["income"]}
+    for r in raw["income"]:
+        income.append({"id": r.get("id"), "kind": "manual", "date": parse_date(r.get("income_date")),
+                       "source": "Manual entry", "title": r.get("income_title") or "", "category": r.get("category") or "",
+                       "amount": num(r.get("amount")), "method": r.get("payment_method") or "Other",
+                       "party": r.get("received_from") or "", "reference": r.get("reference_no") or "",
+                       "by": r.get("created_by") or ""})
+    raw_exp = {r["id"]: r for r in raw["expenses"]}
+    expenses = [{"id": r.get("id"), "kind": "expense", "date": parse_date(r.get("expense_date")),
+                 "title": r.get("expense_title") or "", "category": r.get("category") or "",
+                 "inventory": (r.get("category") or "") in INVENTORY_EXPENSE_CATEGORIES,
+                 "amount": num(r.get("amount")), "method": r.get("payment_method") or "Other",
+                 "party": r.get("paid_to") or "", "reference": r.get("reference_no") or "",
+                 "by": r.get("created_by") or ""} for r in raw["expenses"]]
+    mismatch = [s for s in active if abs(pay_sum.get(s["id"], 0) - num(s.get("paid_amount"))) > 0.5]
+    return {"active": active, "income": income, "expenses": expenses, "cost_by_sale": cost_by_sale,
+            "invoice_nos": {str(s.get("invoice_no", "")).strip().lower() for s in sales},
+            "raw_income": raw_income, "raw_expenses": raw_exp, "mismatch": mismatch, "pay_sum": pay_sum,
+            "stock_cost": sum(num(p.get("purchase_price")) * num(p.get("quantity")) for p in raw["products"])}
+
+
+def fin_calc(ctx, d1, d2):
+    def inside(d):
+        return d is not None and d1 <= d <= d2
+
+    sales_p = [s for s in ctx["active"] if inside(parse_date(s.get("sale_date")))]
+    inc = [r for r in ctx["income"] if inside(r["date"])]
+    exp = [r for r in ctx["expenses"] if inside(r["date"])]
+    revenue = sum(num(s.get("total")) for s in sales_p)
+    cogs = sum(ctx["cost_by_sale"].get(s["id"], 0) for s in sales_p)
+    received = sum(r["amount"] for r in inc if r["kind"] == "sales")
+    other = sum(r["amount"] for r in inc if r["kind"] == "manual")
+    op = sum(r["amount"] for r in exp if not r["inventory"])
+    inv = sum(r["amount"] for r in exp if r["inventory"])
+    gross = revenue - cogs
+    return {
+        "sales": sales_p, "income": inc, "expenses": exp, "revenue": revenue, "cogs": cogs, "gross": gross,
+        "received": received, "other": other, "total_income": received + other, "op": op, "inv": inv,
+        "expense_total": op + inv, "net": gross + other - op,
+        "outstanding": sum(max(num(s.get("total")) - num(s.get("paid_amount")), 0) for s in sales_p),
+        "no_cost": sum(1 for s in sales_p if s["id"] not in ctx["cost_by_sale"]),
+        "cash_in": sum(r["amount"] for r in inc if r["method"] == "Cash"),
+        "cash_out": sum(r["amount"] for r in exp if r["method"] == "Cash"),
+    }
+
+
+def period_range(label, custom=None):
+    t = today_pk()
+    if label == "Today":
+        return t, t
+    if label == "Yesterday":
+        y = t - timedelta(days=1)
+        return y, y
+    if label == "This Week":
+        return t - timedelta(days=t.weekday()), t
+    if label == "This Month":
+        return t.replace(day=1), t
+    if label == "Last Month":
+        end = t.replace(day=1) - timedelta(days=1)
+        return end.replace(day=1), end
+    if label == "All Time":
+        return ALL_TIME_START, t
+    return custom
+
+
+def fin_rng_text(d1, d2):
+    if d1 <= ALL_TIME_START:
+        return f"All time (up to {d2.strftime('%d %b %Y')})"
+    if d1 == d2:
+        return d1.strftime("%d %b %Y")
+    return f"{d1.strftime('%d %b %Y')} to {d2.strftime('%d %b %Y')}"
+
+
+def pl_lines(c):
+    return [
+        ("Total Sales Revenue (invoiced, after discounts)", c["revenue"], "main"),
+        ("Less: Cost of Goods Sold (purchase cost of items sold)", -c["cogs"], "main"),
+        ("GROSS PROFIT", c["gross"], "total"),
+        ("Add: Other Business Income (manual entries)", c["other"], "main"),
+        ("Less: Operating Expenses", -c["op"], "main"),
+        ("NET PROFIT", c["net"], "total"),
+        ("Memo: Customer payments received (actual money)", c["received"], "memo"),
+        ("Memo: Outstanding customer balances (invoices in period)", c["outstanding"], "memo"),
+        ("Memo: Inventory purchases recorded (NOT deducted from profit)", c["inv"], "memo"),
+        ("Memo: Total money received (customer payments + manual income)", c["total_income"], "memo"),
+        ("Memo: Total money paid out (all recorded expenses)", c["expense_total"], "memo"),
+    ]
+
+
+def money_by_method(c):
+    agg = {}
+    for r in c["income"]:
+        agg.setdefault(r["method"], [0.0, 0.0])[0] += r["amount"]
+    for r in c["expenses"]:
+        agg.setdefault(r["method"], [0.0, 0.0])[1] += r["amount"]
+    order = FIN_METHODS + ["Unspecified"]
+    keys = sorted(agg, key=lambda m: order.index(m) if m in order else 99)
+    return [(m, agg[m][0], agg[m][1], agg[m][0] - agg[m][1]) for m in keys]
+
+
+def group_amounts(rows):
+    agg = {}
+    for r in rows:
+        e = agg.setdefault(r["category"] or "Uncategorised", [0, 0.0])
+        e[0] += 1
+        e[1] += r["amount"]
+    return sorted(((k, v[0], v[1]) for k, v in agg.items()), key=lambda x: -x[2])
+
+
+def trend_df(c, d1, d2):
+    monthly = (d2 - d1).days > 62
+
+    def key(d):
+        return d.strftime("%Y-%m") if monthly else d.isoformat()
+
+    data = {}
+    for r in c["income"]:
+        data.setdefault(key(r["date"]), [0.0, 0.0])[0] += r["amount"]
+    for r in c["expenses"]:
+        data.setdefault(key(r["date"]), [0.0, 0.0])[1] += r["amount"]
+    if not data:
+        return pd.DataFrame(columns=["Money In", "Money Out"])
+    if not monthly:
+        d = d1
+        while d <= d2:
+            data.setdefault(d.isoformat(), [0.0, 0.0])
+            d += timedelta(days=1)
+    keys = sorted(data)
+    return pd.DataFrame({"Money In": [data[k][0] for k in keys], "Money Out": [data[k][1] for k in keys]}, index=keys)
+
+
+def fin_sales_rows(ctx, c):
+    rows = []
+    for s in sorted(c["sales"], key=lambda x: x.get("id", 0)):
+        total, paid = num(s.get("total")), num(s.get("paid_amount"))
+        cost = ctx["cost_by_sale"].get(s["id"], 0)
+        rows.append({"invoice": s.get("invoice_no"), "date": str(s.get("sale_date"))[:10], "customer": s.get("customer_name"),
+                     "sold_by": s.get("sold_by"), "revenue": total, "paid": paid, "balance": max(total - paid, 0),
+                     "cogs": cost, "gross": total - cost})
+    return rows
+
+
+# ---------------- PDF reports ----------------
+def _cat_table(rows, label="Category"):
+    data = group_amounts(rows)
+    return ("table", [label, "Entries", "Amount"], [[k, n, pkr(a)] for k, n, a in data], [50, 10, 20], {1, 2},
+            ["TOTAL", sum(n for _, n, _ in data), pkr(sum(a for _, _, a in data))] if data else None)
+
+
+def _method_table(c):
+    rows = money_by_method(c)
+    return ("table", ["Payment Method", "Money Received", "Money Paid Out", "Net"],
+            [[m, pkr(a), pkr(b), pkr(n)] for m, a, b, n in rows], [30, 20, 20, 20], {1, 2, 3},
+            ["TOTAL", pkr(sum(r[1] for r in rows)), pkr(sum(r[2] for r in rows)), pkr(sum(r[3] for r in rows))] if rows else None)
+
+
+def _pl_blocks(ctx, c):
+    a = fin_calc(ctx, ALL_TIME_START, today_pk())
+    blocks = [("h", "Profit & Loss Statement"),
+              ("kpi", [(lbl, pkr(v)) for lbl, v, _ in pl_lines(c)]),
+              ("p", "Revenue is what was invoiced; received money is shown separately. Unpaid balances are never counted as received. "
+                    "Gross profit uses purchase_price and selling_price from the sold items. Buying stock is not deducted as an expense; "
+                    "only the cost of items actually sold is (COGS)."),
+              ("h", "Operating Expenses by Category"),
+              _cat_table([r for r in c["expenses"] if not r["inventory"]]),
+              ("h", "Money by Payment Method"), _method_table(c),
+              ("kpi", [("Cash in hand (all recorded cash transactions)", pkr(a["cash_in"] - a["cash_out"]))])]
+    if c["no_cost"]:
+        blocks.append(("p", f"Note: {c['no_cost']} invoice(s) have no item records, so their cost could not be calculated."))
+    return blocks
+
+
+def _income_blocks(c, d1, d2, daily_totals=False):
+    rows = sorted(c["income"], key=lambda r: (r["date"], r["amount"]))
+    blocks = [("h", "Income Summary"),
+              ("kpi", [("Total money received", pkr(c["total_income"])), ("Customer payments (from billing, automatic)", pkr(c["received"])),
+                       ("Other business income (manual entries)", pkr(c["other"])), ("Number of income entries", str(len(rows)))]),
+              ("h", "Income by Category"), _cat_table(c["income"])]
+    if daily_totals and d1 != d2:
+        by_day = {}
+        for r in rows:
+            by_day[r["date"]] = by_day.get(r["date"], 0) + r["amount"]
+        blocks += [("h", "Daily Totals"), ("table", ["Date", "Income"], [[k.strftime("%d %b %Y"), pkr(v)] for k, v in sorted(by_day.items())],
+                                           [20, 20], {1}, ["TOTAL", pkr(sum(by_day.values()))] if by_day else None)]
+    blocks += [("h", "Income by Payment Method"),
+               ("table", ["Payment Method", "Amount"], [[m, pkr(a)] for m, a, _, _ in money_by_method(c) if a], [30, 20], {1}, None),
+               ("h", "Income Details")]
+    shown, note = cap_rows(rows)
+    if note:
+        blocks.append(("p", note))
+    blocks.append(("table", ["Date", "Source", "Title", "Category", "Received From", "Method", "Reference", "Amount"],
+                   [[r["date"].strftime("%d %b %Y"), r["source"], r["title"], r["category"], r["party"], r["method"],
+                     r["reference"], pkr(r["amount"])] for r in shown],
+                   [9, 12, 20, 16, 14, 8, 12, 10], {7}, ["TOTAL", "", "", "", "", "", "", pkr(c["total_income"])] if rows else None))
+    return blocks
+
+
+def _expense_blocks(c):
+    rows = sorted(c["expenses"], key=lambda r: (r["date"], r["amount"]))
+    blocks = [("h", "Expense Summary"),
+              ("kpi", [("Total expenses recorded", pkr(c["expense_total"])), ("Operating expenses (reduce profit)", pkr(c["op"])),
+                       ("Inventory purchases (tracked separately)", pkr(c["inv"])), ("Number of expense entries", str(len(rows)))]),
+              ("h", "Expenses by Category"), _cat_table(c["expenses"]), ("h", "Expense Details")]
+    shown, note = cap_rows(rows)
+    if note:
+        blocks.append(("p", note))
+    blocks.append(("table", ["Date", "Title", "Category", "Type", "Paid To", "Method", "Receipt / Ref", "Amount"],
+                   [[r["date"].strftime("%d %b %Y"), r["title"], r["category"], "Inventory" if r["inventory"] else "Operating",
+                     r["party"], r["method"], r["reference"], pkr(r["amount"])] for r in shown],
+                   [9, 20, 16, 9, 14, 8, 12, 10], {7}, ["TOTAL", "", "", "", "", "", "", pkr(c["expense_total"])] if rows else None))
+    return blocks
+
+
+def _sales_blocks(ctx, c):
+    rows = fin_sales_rows(ctx, c)
+    shown, note = cap_rows(rows)
+    blocks = [("h", "Sales Invoices in Period (Revenue vs Received)")]
+    if note:
+        blocks.append(("p", note))
+    blocks.append(("table", ["Invoice", "Date", "Customer", "Sold By", "Revenue", "Paid", "Balance", "Cost (COGS)", "Gross Profit"],
+                   [[r["invoice"], r["date"], r["customer"], r["sold_by"], pkr(r["revenue"]), pkr(r["paid"]), pkr(r["balance"]),
+                     pkr(r["cogs"]), pkr(r["gross"])] for r in shown],
+                   [14, 9, 18, 10, 11, 11, 11, 11, 11], {4, 5, 6, 7, 8},
+                   ["TOTAL", "", "", "", pkr(c["revenue"]), pkr(sum(r["paid"] for r in rows)), pkr(c["outstanding"]),
+                    pkr(c["cogs"]), pkr(c["gross"])] if rows else None))
+    return blocks
+
+
+def fin_pdf(ctx, d1, d2, kind):
+    require_admin()
+    c = fin_calc(ctx, d1, d2)
+    titles = {"daily": "Daily Income Report", "monthly": "Monthly Income Report", "expense": "Expense Report",
+              "pl": "Profit & Loss Report", "complete": "Complete Financial Report"}
+    if kind in ("daily", "monthly"):
+        blocks = _income_blocks(c, d1, d2, daily_totals=(kind == "monthly"))
+    elif kind == "expense":
+        blocks = _expense_blocks(c)
+    elif kind == "pl":
+        blocks = _pl_blocks(ctx, c)
+    else:
+        blocks = ([("kpi", [("Period", fin_rng_text(d1, d2)), ("Prepared by", current_username())])] + _pl_blocks(ctx, c)
+                  + _income_blocks(c, d1, d2, daily_totals=True) + _expense_blocks(c) + _sales_blocks(ctx, c))
+    return build_pdf(titles[kind], fin_rng_text(d1, d2), blocks)
+
+
+# ---------------- Excel workbook ----------------
+def fin_excel(ctx, d1, d2):
+    require_admin()
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        raise RuntimeError("Excel library missing. Add 'openpyxl' to requirements.txt and reboot the app.")
+    c = fin_calc(ctx, d1, d2)
+    stamp = backup_now().strftime("%d %b %Y, %I:%M %p")
+    navy = PatternFill("solid", fgColor="0B1F3A")
+    light = PatternFill("solid", fgColor="DBE7FB")
+    thin = Side(style="thin", color="CBD5E1")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    money_fmt = '"Rs "#,##0.00'
+    sub = f"Period: {fin_rng_text(d1, d2)}   |   Prepared: {stamp}"
+    wb = Workbook()
+
+    def heading(ws, title):
+        ws["A1"] = f"LAPTOP HOUSE BUNER — {title}"
+        ws["A1"].font = Font(bold=True, size=14, color="0B1F3A")
+        ws["A2"] = sub
+        ws["A2"].font = Font(italic=True, color="64748B")
+        ws.sheet_properties.tabColor = "1F6FEB"
+
+    ws = wb.active
+    ws.title = "Profit & Loss"
+    heading(ws, "Profit & Loss")
+    for j, h in enumerate(("Item", "Amount (Rs)"), 1):
+        cell = ws.cell(row=3, column=j, value=h)
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = navy
+    r = 3
+    for label, value, kind in pl_lines(c):
+        r += 1
+        ws.cell(row=r, column=1, value=label)
+        cell = ws.cell(row=r, column=2, value=round(value, 2))
+        cell.number_format = money_fmt
+        if kind == "total":
+            ws.cell(row=r, column=1).font = Font(bold=True)
+            cell.font = Font(bold=True)
+            ws.cell(row=r, column=1).fill = light
+            cell.fill = light
+        elif kind == "memo":
+            ws.cell(row=r, column=1).font = Font(italic=True, color="475569")
+    r += 2
+    ws.cell(row=r, column=1, value="Money by payment method").font = Font(bold=True)
+    for j, h in enumerate(("Method", "Received", "Paid out", "Net"), 1):
+        cell = ws.cell(row=r + 1, column=j, value=h)
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = navy
+    rr = r + 1
+    for m, a_, b_, n_ in money_by_method(c):
+        rr += 1
+        ws.cell(row=rr, column=1, value=m)
+        for j, v in enumerate((a_, b_, n_), 2):
+            ws.cell(row=rr, column=j, value=round(v, 2)).number_format = money_fmt
+    ws.column_dimensions["A"].width = 66
+    for col in "BCD":
+        ws.column_dimensions[col].width = 18
+
+    def sheet(title, header, rows, money_cols):
+        ws = wb.create_sheet(title)
+        heading(ws, title)
+        for j, h in enumerate(header, 1):
+            cell = ws.cell(row=3, column=j, value=h)
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = navy
+            cell.border = border
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        widths = [len(h) + 4 for h in header]
+        for i, row in enumerate(rows, 4):
+            for j, v in enumerate(row, 1):
+                cell = ws.cell(row=i, column=j, value=v)
+                if isinstance(v, str):
+                    if v.startswith("="):
+                        cell.data_type = "s"
+                    widths[j - 1] = max(widths[j - 1], min(len(v) + 2, 50))
+                elif isinstance(v, date):
+                    cell.number_format = "DD-MMM-YYYY"
+                    widths[j - 1] = max(widths[j - 1], 14)
+                elif j - 1 in money_cols:
+                    cell.number_format = money_fmt
+                    widths[j - 1] = max(widths[j - 1], len(f"{v:,.2f}") + 6)
+        if rows:
+            t = 4 + len(rows)
+            ws.cell(row=t, column=1, value="TOTAL").font = Font(bold=True)
+            for j in money_cols:
+                cell = ws.cell(row=t, column=j + 1, value=round(sum(x[j] for x in rows), 2))
+                cell.number_format = money_fmt
+                cell.font = Font(bold=True)
+            for j in range(1, len(header) + 1):
+                ws.cell(row=t, column=j).fill = light
+        for j, w in enumerate(widths, 1):
+            ws.column_dimensions[get_column_letter(j)].width = max(10, min(w, 50))
+        ws.freeze_panes = "A4"
+        ws.auto_filter.ref = f"A3:{get_column_letter(len(header))}{max(len(rows) + 3, 3)}"
+        ws.print_title_rows = "3:3"
+        ws.page_setup.orientation = "landscape"
+
+    inc = sorted(c["income"], key=lambda x: (x["date"], x["amount"]))
+    sheet("Income", ["Date", "Source", "Title", "Category", "Received From", "Method", "Reference", "Amount (Rs)"],
+          [[x["date"], x["source"], x["title"], x["category"], x["party"], x["method"], x["reference"], x["amount"]] for x in inc], {7})
+    exp = sorted(c["expenses"], key=lambda x: (x["date"], x["amount"]))
+    sheet("Expenses", ["Date", "Title", "Category", "Type", "Paid To", "Method", "Receipt / Ref", "Amount (Rs)"],
+          [[x["date"], x["title"], x["category"], "Inventory purchase" if x["inventory"] else "Operating", x["party"], x["method"],
+            x["reference"], x["amount"]] for x in exp], {7})
+    sheet("Sales", ["Invoice", "Date", "Customer", "Sold By", "Revenue (Rs)", "Paid (Rs)", "Balance (Rs)", "Cost / COGS (Rs)", "Gross Profit (Rs)"],
+          [[x["invoice"], x["date"], x["customer"], x["sold_by"], x["revenue"], x["paid"], x["balance"], x["cogs"], x["gross"]]
+           for x in fin_sales_rows(ctx, c)], {4, 5, 6, 7, 8})
+    pays = [x for x in inc if x["kind"] == "sales"]
+    sheet("Payments", ["Date", "Invoice", "Customer", "Category", "Method", "Received By", "Amount (Rs)"],
+          [[x["date"], x["reference"], x["party"], x["category"], x["method"], x["by"], x["amount"]] for x in pays], {6})
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def verify_fin_excel(data, c):
+    from openpyxl import load_workbook
+    wb = load_workbook(io.BytesIO(data))
+    exp = {"Income": len(c["income"]), "Expenses": len(c["expenses"]), "Sales": len(c["sales"]),
+           "Payments": sum(1 for r in c["income"] if r["kind"] == "sales")}
+    out = []
+    for name, n in exp.items():
+        found = wb[name].max_row - 3 - (1 if n else 0)
+        out.append((found == n, f"{name}: {found} of {n} rows"))
+    return out
+
+
+# ---------------- UI ----------------
+def fin_chart(df, color):
+    if df.empty:
+        st.caption("No data for this period.")
+        return
+    try:
+        st.bar_chart(df, color=color)
+    except Exception:
+        st.bar_chart(df)
+
+
+def ledger_df(rows, kind):
+    out = []
+    for r in sorted(rows, key=lambda r: (r["date"] or date.min, r["id"] or 0), reverse=True):
+        base = {"ID": str(r["id"]) if r["id"] is not None else "auto", "Date": r["date"].isoformat() if r["date"] else ""}
+        if kind == "income":
+            base.update({"Source": r["source"], "Title": r["title"], "Category": r["category"], "Received From": r["party"]})
+        else:
+            base.update({"Title": r["title"], "Category": r["category"],
+                         "Type": "Inventory purchase" if r["inventory"] else "Operating", "Paid To": r["party"]})
+        base.update({"Method": r["method"], "Reference": r["reference"], "Amount": r["amount"], "Added By": r["by"]})
+        out.append(base)
+    return pd.DataFrame(out)
+
+
+def fin_form(kind, prefix, row=None):
+    cfg = FIN_CFG[kind]
+    row = row or {}
+    c1, c2 = st.columns(2)
+    title = c1.text_input(cfg["title_label"], value=row.get(cfg["title"]) or "", key=f"{prefix}_t")
+    cats = cfg["cats"] + ([row["category"]] if row.get("category") and row["category"] not in cfg["cats"] else [])
+    cat = c2.selectbox("Category", cats, index=option_index(cats, row.get("category")), key=f"{prefix}_c")
+    c3, c4, c5 = st.columns(3)
+    amount = c3.number_input("Amount (PKR)", min_value=0.0, step=100.0, value=num(row.get("amount")), key=f"{prefix}_a")
+    methods = FIN_METHODS + ([row["payment_method"]] if row.get("payment_method") and row["payment_method"] not in FIN_METHODS else [])
+    method = c4.selectbox("Payment Method", methods, index=option_index(methods, row.get("payment_method")), key=f"{prefix}_m")
+    d = parse_date(row.get(cfg["date"])) or today_pk()
+    dt = c5.date_input("Date", value=min(d, today_pk()), max_value=today_pk(), key=f"{prefix}_d")
+    c6, c7 = st.columns(2)
+    party = c6.text_input(cfg["party_label"], value=row.get(cfg["party"]) or "", key=f"{prefix}_p")
+    ref = c7.text_input(cfg["ref_label"], value=row.get("reference_no") or "", key=f"{prefix}_r")
+    desc = st.text_area("Description", value=row.get("description") or "", key=f"{prefix}_x")
+    return {cfg["title"]: title.strip(), "category": cat, "amount": float(amount), "payment_method": method,
+            cfg["date"]: dt.isoformat(), cfg["party"]: party.strip(), "description": desc.strip(), "reference_no": ref.strip()}
+
+
+def fin_crud(kind, ctx, c, tables_ok):
+    cfg = FIN_CFG[kind]
+    is_inc = kind == "income"
+    rows = c["income"] if is_inc else c["expenses"]
+    t1, t2, t3 = st.tabs(["📋 Records", f"➕ Add {'Income' if is_inc else 'Expense'}", "✏️ Edit / Delete"])
+
+    with t1:
+        if is_inc:
+            cards([("💰", "Total Income Received", pkr(c["total_income"]), "#12b76a"),
+                   ("🧾", "Customer Payments (auto)", pkr(c["received"]), "#1f6feb"),
+                   ("✍️", "Manual Income", pkr(c["other"]), "#7c3aed"), ("📄", "Entries", len(rows), "#0ea5e9")])
+        else:
+            cards([("💸", "Total Expenses", pkr(c["expense_total"]), "#d92d20"),
+                   ("🏪", "Operating Expenses", pkr(c["op"]), "#f79009"),
+                   ("📦", "Inventory Purchases", pkr(c["inv"]), "#7c3aed"), ("📄", "Entries", len(rows), "#0ea5e9")])
+        f1, f2, f3 = st.columns([2, 1, 1])
+        search = f1.text_input("🔍 Search title, party or reference", key=f"flt_{kind}_search").strip().lower()
+        cat = f2.selectbox("Category", ["All categories"] + cfg["cats"], key=f"flt_{kind}_cat")
+        src = f3.selectbox("Source", ["All sources", "Sales payments (auto)", "Manual entries"], key="flt_income_src") if is_inc else "All sources"
+        view = [r for r in rows
+                if (not search or search in f"{r['title']} {r['party']} {r['reference']}".lower())
+                and (cat == "All categories" or r["category"] == cat)
+                and (src == "All sources" or (src.startswith("Sales") and r["kind"] == "sales") or (src.startswith("Manual") and r["kind"] == "manual"))]
+        if not view:
+            empty_state("💰" if is_inc else "💸", "No records", "Nothing matches the selected period and filters.")
+        else:
+            show_table(ledger_df(view, kind))
+            st.markdown(f"**Total shown: {pkr(sum(r['amount'] for r in view))}** ({len(view)} entries)")
+            st.markdown("##### By category")
+            show_table(pd.DataFrame([{"Category": k, "Entries": n, "Amount": a} for k, n, a in group_amounts(view)]))
+        if is_inc:
+            st.caption("Customer payments from New Sale / Billing appear automatically with source 'Sales payment (auto)'. "
+                       "They cannot be edited here (use Sales History) so nothing is counted twice.")
+
+    with t2:
+        if not tables_ok:
+            st.warning("Run the SQL migration first (see the warning at the top of this page).")
+        else:
+            if is_inc:
+                st.info("Do NOT enter sales made through New Sale / Billing here: they are already included automatically. "
+                        "Use this form for repairs, software work, accessories or goods sold outside billing and other income. "
+                        "If you sell goods outside billing, also record their purchase cost as an expense so profit stays accurate.")
+            else:
+                st.info("Stock purchases (Laptop Purchasing / Accessories Purchasing) are recorded as cash paid out but are NOT deducted "
+                        "from profit. Profit uses the purchase cost of the items actually sold.")
+            with st.form(f"add_{kind}", clear_on_submit=True):
+                vals = fin_form(kind, f"add_{kind}")
+                submit = st.form_submit_button("💾 Save", type="primary")
+            if submit:
+                err = fin_validate(kind, vals, ctx)
+                dup, fp = fin_is_duplicate(kind, vals)
+                if err:
+                    st.error(err)
+                elif dup:
+                    st.error("This looks like a duplicate of the entry you just saved. Entry blocked.")
+                else:
+                    try:
+                        fin_insert(kind, vals)
+                        st.session_state["fin_last_fp"] = (fp, datetime.now())
+                        flash("success", f"{'Income' if is_inc else 'Expense'} saved.")
+                        st.rerun()
+                    except PermissionError as e:
+                        st.error(str(e))
+                    except Exception as e:
+                        st.error(f"Save failed: {e}")
+
+    with t3:
+        editable = [r for r in rows if r["kind"] != "sales"]
+        if not tables_ok or not editable:
+            empty_state("✏️", "Nothing to edit", "Manual entries in the selected period appear here. Change the period at the top to find older entries.")
+        else:
+            editable = sorted(editable, key=lambda r: (r["date"], r["id"]), reverse=True)
+            ids = [r["id"] for r in editable]
+            labels = {r["id"]: f"#{r['id']} | {r['date']} | {r['title']} | {pkr(r['amount'])}" for r in editable}
+            rid = st.selectbox("Select entry", ids, format_func=lambda i: labels[i], key=f"edit_{kind}_id")
+            raw = ctx["raw_income" if is_inc else "raw_expenses"].get(rid, {})
+            with st.form(f"edit_{kind}_form_{rid}"):
+                vals = fin_form(kind, f"ed_{kind}{rid}", raw)
+                save = st.form_submit_button("💾 Save Changes", type="primary")
+            if save:
+                err = fin_validate(kind, vals, ctx)
+                if err:
+                    st.error(err)
+                else:
+                    try:
+                        fin_update(kind, rid, vals)
+                        flash("success", "Entry updated.")
+                        st.rerun()
+                    except PermissionError as e:
+                        st.error(str(e))
+                    except Exception as e:
+                        st.error(f"Update failed: {e}")
+            st.markdown("##### 🗑️ Delete this entry")
+            st.warning(f"You are about to permanently delete: **{labels[rid]}**. This cannot be undone.")
+            ok = st.checkbox("Yes, delete this entry", key=f"del_{kind}_c_{rid}")
+            if st.button("Delete Entry", disabled=not ok, key=f"del_{kind}_b_{rid}"):
+                try:
+                    fin_delete(kind, rid)
+                    flash("success", "Entry deleted.")
+                    st.rerun()
+                except PermissionError as e:
+                    st.error(str(e))
+                except Exception as e:
+                    st.error(f"Delete failed: {e}")
+
+
+def fin_dashboard(ctx, c, label, d1, d2):
+    today = today_pk()
+    a = fin_calc(ctx, ALL_TIME_START, today)
+    month = fin_calc(ctx, today.replace(day=1), today)
+    st.markdown("### 🏦 Overall Financial Position (all time)")
+    cards([("🧾", "Total Sales Income (invoiced)", pkr(a["revenue"]), "#1f6feb"),
+           ("💵", "Total Payments Received", pkr(a["received"]), "#12b76a"),
+           ("⏳", "Outstanding Customer Balances", pkr(a["outstanding"]), "#f79009"),
+           ("🏭", "Product Purchase Cost (sold items)", pkr(a["cogs"]), "#7c3aed"),
+           ("💸", "Total Business Expenses", pkr(a["expense_total"]), "#d92d20"),
+           ("📈", "Net Profit", pkr(a["net"]), "#12b76a" if a["net"] >= 0 else "#d92d20"),
+           ("👛", "Cash in Hand (recorded cash)", pkr(a["cash_in"] - a["cash_out"]), "#0ea5e9"),
+           ("📅", "Total Expenses This Month", pkr(month["expense_total"]), "#db2777")])
+    with st.expander("More figures"):
+        cards([("✍️", "Other Business Income", pkr(a["other"]), "#7c3aed"),
+               ("🏪", "Operating Expenses (in profit)", pkr(a["op"]), "#f79009"),
+               ("📦", "Inventory Purchases (not in profit)", pkr(a["inv"]), "#0ea5e9"),
+               ("🗄️", "Stock on Hand (at purchase cost)", pkr(ctx["stock_cost"]), "#1f6feb")])
+    st.caption("Sales income is what you invoiced. Payments received is the money actually collected. "
+               "Outstanding balances are unpaid and are never counted as received cash.")
+
+    st.markdown(f"### 📅 {label} — {fin_rng_text(d1, d2)}")
+    cards([("💰", "Income Received", pkr(c["total_income"]), "#12b76a"), ("💸", "Expenses Paid", pkr(c["expense_total"]), "#d92d20"),
+           ("💵", "Customer Payments Received", pkr(c["received"]), "#1f6feb"),
+           ("⏳", "Outstanding (invoices in period)", pkr(c["outstanding"]), "#f79009"),
+           ("🧾", "Sales Revenue", pkr(c["revenue"]), "#0ea5e9"), ("📊", "Gross Profit", pkr(c["gross"]), "#7c3aed"),
+           ("📈", "Net Profit", pkr(c["net"]), "#12b76a" if c["net"] >= 0 else "#d92d20")])
+
+    st.markdown("#### Money in vs money out")
+    fin_chart(trend_df(c, d1, d2), ["#12b76a", "#d92d20"])
+    g1, g2 = st.columns(2)
+    with g1:
+        st.markdown("#### Expenses by category")
+        df = pd.DataFrame([{"Category": k, "Amount": a_} for k, _, a_ in group_amounts(c["expenses"])])
+        fin_chart(df.set_index("Category") if not df.empty else df, "#d92d20")
+    with g2:
+        st.markdown("#### Income by category")
+        df = pd.DataFrame([{"Category": k, "Amount": a_} for k, _, a_ in group_amounts(c["income"])])
+        fin_chart(df.set_index("Category") if not df.empty else df, "#12b76a")
+
+    st.markdown("#### 🧮 Profit & Loss statement")
+    show_table(pd.DataFrame([{"Item": lbl, "Amount": pkr(v)} for lbl, v, _ in pl_lines(c)]))
+    if c["no_cost"]:
+        st.warning(f"{c['no_cost']} invoice(s) in this period have no item records, so their cost is unknown and profit may be overstated.")
+    st.markdown("#### 💳 Money by payment method")
+    mm = money_by_method(c)
+    if mm:
+        show_table(pd.DataFrame([{"Method": m, "Received": pkr(x), "Paid Out": pkr(y), "Net": pkr(z)} for m, x, y, z in mm]))
+    else:
+        st.caption("No money movements in this period.")
+
+    if ctx["mismatch"]:
+        with st.expander(f"⚠️ {len(ctx['mismatch'])} invoice(s) where payment records differ from the paid amount"):
+            st.write("Income uses the payment records. These invoices have a paid amount that does not match their payment records "
+                     "(for example after a data reset). Please review them in Sales History.")
+            show_table(pd.DataFrame([{"Invoice": s.get("invoice_no"), "Customer": s.get("customer_name"),
+                                      "Paid amount on invoice": num(s.get("paid_amount")),
+                                      "Sum of payment records": ctx["pay_sum"].get(s["id"], 0)} for s in ctx["mismatch"]]))
+    with st.expander("ℹ️ How profit is calculated"):
+        st.markdown(
+            "- **Revenue** = invoice totals (after discount). **Received money** = payment records. Unpaid balances are not cash.\n"
+            "- **Cost of goods sold** = purchase price x quantity of the items actually sold.\n"
+            "- **Gross profit** = revenue − cost of goods sold.\n"
+            "- **Net profit** = gross profit + other business income − operating expenses.\n"
+            "- **Laptop/Accessories Purchasing** expenses are cash paid out but are *not* deducted from profit (that would double-count "
+            "the cost already included in cost of goods sold).\n"
+            "- Cancelled invoices are excluded, and their payments are treated as refunded.\n"
+            "- **Cash in hand** = all recorded Cash income − all recorded Cash expenses. Customer payments recorded before this update "
+            "have no payment method and are not counted as cash. Add an 'Other Business Income' entry (Cash) for your opening balance.")
+
+
+def fin_reports_tab(ctx, d1, d2):
+    st.caption(f"Reports use the period selected at the top: **{fin_rng_text(d1, d2)}** (the daily and monthly reports have their own pickers).")
+    p1, p2 = st.columns(2)
+    day = p1.date_input("Day for the Daily Income Report", value=today_pk(), max_value=today_pk(), key="flt_fin_day")
+    months, y, m = [], today_pk().year, today_pk().month
+    for _ in range(24):
+        months.append(date(y, m, 1))
+        m -= 1
+        if m == 0:
+            m, y = 12, y - 1
+    msel = p2.selectbox("Month for the Monthly Income Report", months, format_func=lambda d: d.strftime("%B %Y"), key="flt_fin_month")
+    mend = (date(msel.year + (msel.month == 12), msel.month % 12 + 1, 1) - timedelta(days=1))
+    mend = min(mend, today_pk())
+
+    specs = [("daily", "📅 Daily Income Report", "PDF", lambda: fin_pdf(ctx, day, day, "daily"), f"Daily_Income_Report_{day}.pdf", fin_rng_text(day, day)),
+             ("monthly", "🗓️ Monthly Income Report", "PDF", lambda: fin_pdf(ctx, msel, mend, "monthly"), f"Monthly_Income_Report_{msel:%Y-%m}.pdf", fin_rng_text(msel, mend)),
+             ("expense", "💸 Expense Report", "PDF", lambda: fin_pdf(ctx, d1, d2, "expense"), f"Expense_Report_{d1}_{d2}.pdf", fin_rng_text(d1, d2)),
+             ("pl", "🧮 Profit & Loss Report", "PDF", lambda: fin_pdf(ctx, d1, d2, "pl"), f"Profit_and_Loss_{d1}_{d2}.pdf", fin_rng_text(d1, d2)),
+             ("complete", "📚 Complete Financial Report", "PDF", lambda: fin_pdf(ctx, d1, d2, "complete"), f"Complete_Financial_Report_{d1}_{d2}.pdf", fin_rng_text(d1, d2)),
+             ("excel", "📗 Financial Excel Workbook", "Excel", lambda: fin_excel(ctx, d1, d2), f"Financial_Workbook_{d1}_{d2}.xlsx", fin_rng_text(d1, d2))]
+    cols = st.columns(3)
+    for n, (key, title, short, fn, fname, rng_text) in enumerate(specs):
+        with cols[n % 3]:
+            st.markdown(f"#### {title}")
+            st.caption(f"Period: {rng_text}")
+            if st.button(f"Generate {short}", key=f"fin_gen_{key}", type="primary"):
+                try:
+                    with st.spinner("Creating report..."):
+                        data = fn()
+                    item = {"data": data, "name": fname, "label": rng_text, "checks": []}
+                    if key == "excel":
+                        item["checks"] = verify_fin_excel(data, fin_calc(ctx, d1, d2))
+                    st.session_state[f"fin_{key}"] = item
+                    st.toast("Report ready", icon="📄")
+                except PermissionError as e:
+                    st.error(str(e))
+                except Exception as e:
+                    st.session_state.pop(f"fin_{key}", None)
+                    st.error(f"Could not create the report: {e}")
+            item = st.session_state.get(f"fin_{key}")
+            if item:
+                mime = "application/pdf" if item["name"].endswith(".pdf") else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                st.download_button(f"⬇️ Download {short} ({len(item['data']) / 1024:,.0f} KB)", item["data"], file_name=item["name"],
+                                   mime=mime, key=f"fin_dl_{key}")
+                if item["label"] != rng_text:
+                    st.warning("The period changed after this file was created. Generate it again.")
+                if item["checks"]:
+                    with st.expander("Data checks"):
+                        for ok, text in item["checks"]:
+                            st.write(("✅ " if ok else "❌ ") + text)
+
+
+def finance_page():
+    page_header("💹", "Income & Expenses", "Admin only: income, expenses, profit & loss")
+    if not is_admin():
+        st.error("Access denied. This section is for the Owner/Admin only.")
+        return
+    tables_ok = fin_tables_ok()
+    if not tables_ok:
+        st.warning("The Income and Expense tables are not created yet. Run the SQL below once in Supabase "
+                   "(SQL Editor → New query → Run), then press the button. Sales-based figures work meanwhile.")
+        with st.expander("Show the SQL"):
+            st.code(FIN_SQL, language="sql")
+        if st.button("Re-check database"):
+            st.session_state.pop("_cols", None)
+            st.rerun()
+
+    s1, s2 = st.columns([1, 2])
+    label = s1.selectbox("📅 Period", FIN_PERIODS, index=3, key="flt_fin_period")
+    custom = None
+    if label == "Custom Date Range":
+        t = today_pk()
+        rng = s2.date_input("Select dates", value=(t.replace(day=1), t), key="flt_fin_range")
+        if not (isinstance(rng, (tuple, list)) and len(rng) == 2):
+            st.info("Please select both a start date and an end date.")
+            return
+        custom = tuple(rng)
+        if custom[0] > custom[1]:
+            st.error("The start date must be before the end date.")
+            return
+    d1, d2 = period_range(label, custom)
+    s2.caption(f"Showing: {fin_rng_text(d1, d2)}")
+
+    try:
+        with st.spinner("Calculating..."):
+            ctx = build_fin_context(load_fin_data())
+    except PermissionError as e:
+        st.error(str(e))
+        return
+    except Exception as e:
+        st.error(f"Could not load financial data: {e}")
+        return
+    c = fin_calc(ctx, d1, d2)
+
+    t1, t2, t3, t4 = st.tabs(["📊 Dashboard", "💰 Income", "💸 Expenses", "📑 Reports & Downloads"])
+    with t1:
+        fin_dashboard(ctx, c, label, d1, d2)
+    with t2:
+        fin_crud("income", ctx, c, tables_ok)
+    with t3:
+        fin_crud("expense", ctx, c, tables_ok)
+    with t4:
+        fin_reports_tab(ctx, d1, d2)
+
+
+# ==================================================================
 # STAFF MANAGEMENT (ADMIN ONLY)
 # ==================================================================
 def staff_management():
@@ -1411,7 +2285,8 @@ def staff_management():
 # BACKUP & EXPORT CENTER (ADMIN ONLY)
 # ==================================================================
 BACKUP_TABLES = [("Products", "products"), ("Sales", "sales"), ("Sale Items", "sale_items"),
-                 ("Payments", "payments"), ("Staff Accounts", "users")]
+                 ("Payments", "payments"), ("Staff Accounts", "users"),
+                 ("Business Income", "business_income"), ("Business Expenses", "business_expenses")]
 DEFAULT_COLUMNS = {
     "products": ["id", "name", "category", "model", "processor", "ram", "storage", "condition_text",
                  "serial_number", "purchase_price", "selling_price", "quantity", "warranty_days"],
@@ -1421,6 +2296,10 @@ DEFAULT_COLUMNS = {
                    "purchase_price", "warranty_days", "warranty_expiry"],
     "payments": ["id", "sale_id", "amount", "received_by", "note"],
     "users": ["id", "username", "role", "created_at"],
+    "business_income": ["id", "income_title", "category", "amount", "payment_method", "income_date", "received_from",
+                        "description", "reference_no", "created_by", "created_at"],
+    "business_expenses": ["id", "expense_title", "category", "amount", "payment_method", "expense_date", "paid_to",
+                          "description", "reference_no", "created_by", "created_at"],
 }
 SAFE_USER_FIELDS = ("id", "username", "role", "created_at")  # whitelist: hashes are never exported
 PDF_ROW_CAP = 5000
@@ -1440,6 +2319,8 @@ def collect_backup_data():
     require_admin()
     tables = {n: get_data(n) for n in ("products", "sales", "sale_items", "payments")}
     tables["users"] = safe_users(get_data("users"))
+    for t in ("business_income", "business_expenses"):  # new tables may not exist yet
+        tables[t] = get_data(t) if col_exists(t, "id") else []
     return tables
 
 
@@ -1928,7 +2809,8 @@ def main():
     pages = {"🏠 Dashboard": dashboard, "📦 Products & Stock": products_page,
              "🧾 New Sale / Billing": billing_page, "📚 Sales History": sales_history}
     if admin:
-        pages.update({"📊 Reports & PDFs": reports, "💾 Backup & Export": backup_center,
+        pages.update({"📊 Reports & PDFs": reports, "💹 Income & Expenses": finance_page,
+                      "💾 Backup & Export": backup_center,
                       "👥 Staff Management": staff_management, "⚙️ Admin Settings": admin_settings})
     choice = st.sidebar.radio("Navigation", list(pages), label_visibility="collapsed")
     st.sidebar.divider()
