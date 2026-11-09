@@ -1,62 +1,98 @@
 import hashlib
+import io
 import secrets
+import zipfile
 from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 import streamlit as st
 from supabase import create_client
 
-# ------------------------------------------------------------------
+# ==================================================================
 # PAGE SETUP
-# ------------------------------------------------------------------
-st.set_page_config(
-    page_title="Laptop House Buner",
-    page_icon="💻",
-    layout="wide",
-)
-
-st.markdown(
-    """
-    <style>
-    .block-container {padding-top: 2rem; padding-bottom: 2rem;}
-    div[data-testid="stMetric"] {
-        background: #ffffff;
-        border: 1px solid #e3e8ef;
-        border-left: 5px solid #1f6feb;
-        border-radius: 10px;
-        padding: 14px 18px;
-        box-shadow: 0 1px 4px rgba(16, 24, 40, 0.08);
-    }
-    div[data-testid="stMetric"] label,
-    div[data-testid="stMetric"] [data-testid="stMetricValue"] {
-        color: #111827 !important;
-    }
-    section[data-testid="stSidebar"] {border-right: 1px solid #e3e8ef;}
-    .lhb-title {font-size: 2rem; font-weight: 800; margin-bottom: 0;}
-    .lhb-sub {color: #6b7280; margin-top: 0; margin-bottom: 1rem;}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-st.markdown('<p class="lhb-title">💻 Laptop House Buner</p>', unsafe_allow_html=True)
-st.markdown(
-    '<p class="lhb-sub">Shop Management System</p>', unsafe_allow_html=True
-)
+# ==================================================================
+st.set_page_config(page_title="Laptop House Buner", page_icon="💻", layout="wide")
 
 PAYMENT_METHODS = ["Cash", "Bank Transfer", "JazzCash", "EasyPaisa", "Card", "Other"]
+CATEGORIES = ["Laptop", "Accessories", "Desktop", "Other"]
+CONDITIONS = ["Used", "New", "Refurbished"]
 ADMIN_ROLES = ("owner", "admin")
+PERIODS = ["All time", "Today", "Last 7 days", "Last 30 days"]
+
+CSS = """
+<style>
+@keyframes fadeIn {from {opacity: 0; transform: translateY(6px);} to {opacity: 1; transform: none;}}
+@keyframes fadeUp {from {opacity: 0; transform: translateY(14px);} to {opacity: 1; transform: none;}}
+@keyframes drawCheck {to {stroke-dashoffset: 0;}}
+@keyframes popIn {0% {transform: scale(.4); opacity: 0;} 70% {transform: scale(1.08);} 100% {transform: scale(1); opacity: 1;}}
+
+.block-container {padding-top: 1.6rem; padding-bottom: 2rem; animation: fadeIn .28s ease;}
+.lhb-head {display:flex; align-items:center; gap:14px; margin-bottom: 1.1rem;
+  padding: 16px 20px; border-radius: 14px; color:#fff;
+  background: linear-gradient(120deg,#0b1f3a 0%,#164a8a 60%,#1f6feb 100%);
+  box-shadow: 0 6px 18px rgba(15,40,90,.22);}
+.lhb-head .ic {font-size: 2rem; line-height:1;}
+.lhb-head .t {font-size: 1.45rem; font-weight: 800; margin:0; line-height:1.2; color:#fff;}
+.lhb-head .s {font-size: .9rem; margin:0; opacity:.85; color:#fff;}
+
+.kpi-grid {display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:14px; margin: 6px 0 18px 0;}
+.kpi {background:#fff; border:1px solid #e3e8ef; border-left:5px solid var(--c,#1f6feb); border-radius:12px;
+  padding:14px 16px; box-shadow:0 1px 4px rgba(16,24,40,.08); animation: fadeUp .5s both;
+  animation-delay: var(--d,0s); transition: transform .18s ease, box-shadow .18s ease;}
+.kpi:hover {transform: translateY(-3px); box-shadow: 0 8px 18px rgba(16,24,40,.14);}
+.kpi .l {color:#6b7280; font-size:.78rem; font-weight:600; text-transform:uppercase; letter-spacing:.04em;}
+.kpi .v {color:#111827; font-size:1.45rem; font-weight:800; margin-top:4px; word-break:break-word;}
+.kpi .i {float:right; font-size:1.3rem; opacity:.85;}
+
+.empty {text-align:center; padding:34px 16px; border:2px dashed #cbd5e1; border-radius:14px;
+  background:#f8fafc; color:#475569; animation: fadeIn .4s ease;}
+.empty .e1 {font-size:2.4rem;} .empty .e2 {font-weight:700; color:#0f172a; font-size:1.1rem;}
+
+.ok-wrap {display:flex; align-items:center; gap:16px; padding:16px 20px; border-radius:14px;
+  background:#ecfdf3; border:1px solid #abefc6; margin-bottom:12px; animation: popIn .5s ease both;}
+.ok-wrap svg {width:56px; height:56px;}
+.ok-c {fill:none; stroke:#12b76a; stroke-width:3;}
+.ok-p {fill:none; stroke:#12b76a; stroke-width:4; stroke-linecap:round; stroke-linejoin:round;
+  stroke-dasharray:40; stroke-dashoffset:40; animation: drawCheck .6s .3s ease forwards;}
+.ok-wrap .t1 {font-weight:800; color:#054f31; font-size:1.15rem;} .ok-wrap .t2 {color:#054f31;}
+
+.login-card {max-width:430px; margin: 2rem auto 1rem auto; text-align:center; padding:26px 20px 8px 20px;
+  border-radius:16px; background: linear-gradient(120deg,#0b1f3a,#1f6feb); color:#fff;
+  box-shadow:0 10px 28px rgba(15,40,90,.25); animation: fadeUp .5s ease;}
+.login-card h2 {margin:0; color:#fff;} .login-card p {opacity:.85; color:#fff;}
+
+.stButton > button, .stDownloadButton > button {border-radius:10px; font-weight:600;
+  transition: transform .15s ease, box-shadow .15s ease;}
+.stButton > button:hover, .stDownloadButton > button:hover {transform: translateY(-1px);
+  box-shadow: 0 6px 14px rgba(31,111,235,.25);}
+.stTabs [data-baseweb="tab"] {font-weight:600;}
+
+section[data-testid="stSidebar"] {background: linear-gradient(180deg,#0b1f3a 0%,#12315c 100%);}
+section[data-testid="stSidebar"] * {color:#e8eefb;}
+section[data-testid="stSidebar"] hr {border-color: rgba(255,255,255,.18);}
+section[data-testid="stSidebar"] .stButton > button {background: rgba(255,255,255,.1);
+  border: 1px solid rgba(255,255,255,.3); color:#fff; width:100%;}
+section[data-testid="stSidebar"] .stButton > button:hover {background: rgba(255,255,255,.2);}
+.side-brand {font-size:1.3rem; font-weight:800; margin-bottom:2px;}
+.side-user {background: rgba(255,255,255,.1); border-radius:10px; padding:10px 12px; margin:6px 0 4px 0;}
+
+@media (max-width: 768px) {
+  .block-container {padding-left: .8rem; padding-right: .8rem;}
+  .lhb-head {padding: 12px 14px;} .lhb-head .t {font-size: 1.15rem;}
+  .kpi .v {font-size: 1.2rem;}
+}
+@media (prefers-reduced-motion: reduce) {* {animation: none !important; transition: none !important;}}
+</style>
+"""
+st.markdown(CSS, unsafe_allow_html=True)
 
 
-# ------------------------------------------------------------------
+# ==================================================================
 # DATABASE CONNECTION
-# ------------------------------------------------------------------
+# ==================================================================
 @st.cache_resource
 def connect_supabase():
-    return create_client(
-        st.secrets["SUPABASE_URL"],
-        st.secrets["SUPABASE_SECRET_KEY"],
-    )
+    return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_SECRET_KEY"])
 
 
 try:
@@ -71,9 +107,9 @@ except Exception as e:
     st.stop()
 
 
-# ------------------------------------------------------------------
+# ==================================================================
 # GENERAL HELPERS
-# ------------------------------------------------------------------
+# ==================================================================
 def pkr(value):
     try:
         return f"Rs {float(value or 0):,.0f}"
@@ -89,15 +125,57 @@ def num(value):
 
 
 def today_pk():
-    """Today's date in Pakistan time (UTC+5)."""
     return datetime.now(timezone(timedelta(hours=5))).date()
+
+
+def parse_date(value):
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except Exception:
+        return None
 
 
 def show_table(df):
     try:
         st.dataframe(df, width="stretch", hide_index=True)
-    except TypeError:
+    except Exception:
         st.dataframe(df, use_container_width=True, hide_index=True)
+
+
+def page_header(icon, title, sub=""):
+    st.markdown(
+        f'<div class="lhb-head"><div class="ic">{icon}</div><div>'
+        f'<p class="t">{title}</p><p class="s">{sub}</p></div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def cards(items):
+    """items = [(icon, label, value, color)]"""
+    html = '<div class="kpi-grid">'
+    for n, (icon, label, value, color) in enumerate(items):
+        html += (
+            f'<div class="kpi" style="--c:{color};--d:{n * 0.06:.2f}s">'
+            f'<span class="i">{icon}</span><div class="l">{label}</div>'
+            f'<div class="v">{value}</div></div>'
+        )
+    st.markdown(html + "</div>", unsafe_allow_html=True)
+
+
+def empty_state(icon, title, text):
+    st.markdown(
+        f'<div class="empty"><div class="e1">{icon}</div><div class="e2">{title}</div>'
+        f"<div>{text}</div></div>",
+        unsafe_allow_html=True,
+    )
+
+
+def flash(kind, text):
+    st.session_state["flash"] = (kind, text)
+
+
+def current_username():
+    return (st.session_state.get("user") or {}).get("username", "")
 
 
 def is_admin():
@@ -105,21 +183,55 @@ def is_admin():
     return str(user.get("role", "")).strip().lower() in ADMIN_ROLES
 
 
-def current_username():
-    return (st.session_state.get("user") or {}).get("username", "")
+def fresh_role():
+    """Re-check the role in the database (backend permission check)."""
+    uname = current_username()
+    if not uname:
+        return ""
+    rows = (
+        supabase.table("users").select("role").eq("username", uname).limit(1).execute().data
+    )
+    return str(rows[0].get("role", "")).strip().lower() if rows else ""
+
+
+def require_login():
+    if not current_username() or not fresh_role():
+        raise PermissionError("Please log in again.")
+
+
+def require_admin():
+    if fresh_role() not in ADMIN_ROLES:
+        raise PermissionError("Permission denied. Only the Owner/Admin can do this.")
+
+
+def col_exists(table, col):
+    cache = st.session_state.setdefault("_cols", {})
+    key = f"{table}.{col}"
+    if key not in cache:
+        try:
+            supabase.table(table).select(col).limit(1).execute()
+            cache[key] = True
+        except Exception:
+            cache[key] = False
+    return cache[key]
+
+
+def with_optional(table, base, extras):
+    """Add optional columns only if they exist. Returns (data, skipped_names)."""
+    data, skipped = dict(base), []
+    for k, v in extras.items():
+        if col_exists(table, k):
+            data[k] = v
+        else:
+            skipped.append(k)
+    return data, skipped
 
 
 def get_data(table):
-    """Read every row of a table (handles more than 1000 rows)."""
     rows, start = [], 0
     while True:
         chunk = (
-            supabase.table(table)
-            .select("*")
-            .order("id")
-            .range(start, start + 999)
-            .execute()
-            .data
+            supabase.table(table).select("*").order("id").range(start, start + 999).execute().data
             or []
         )
         rows.extend(chunk)
@@ -130,16 +242,14 @@ def get_data(table):
 
 
 def load_products():
-    """Staff never receive purchase prices."""
     rows = get_data("products")
-    if not is_admin():
+    if not is_admin():  # staff never receive purchase prices
         for r in rows:
             r.pop("purchase_price", None)
     return rows
 
 
 def load_sale_items():
-    """Staff never receive purchase prices."""
     rows = get_data("sale_items")
     if not is_admin():
         for r in rows:
@@ -147,480 +257,701 @@ def load_sale_items():
     return rows
 
 
-def insert_with_fallback(table, full_data, base_data):
-    """Try inserting all fields; if some columns do not exist, insert base fields."""
-    try:
-        return supabase.table(table).insert(full_data).execute(), True
-    except Exception as e:
-        msg = str(e).lower()
-        if "column" in msg or "pgrst204" in msg or "schema cache" in msg:
-            return supabase.table(table).insert(base_data).execute(), False
-        raise
+def sale_status(s):
+    return str(s.get("status") or "active").lower()
+
+
+def active_sales(sales):
+    return [s for s in sales if sale_status(s) != "cancelled"]
 
 
 def spec_text(p):
-    parts = [
-        p.get("model"),
-        p.get("processor"),
-        p.get("ram"),
-        p.get("storage"),
-        p.get("graphics"),
-        p.get("display_size"),
-        p.get("condition_text"),
-    ]
+    parts = [p.get("model"), p.get("processor"), p.get("ram"), p.get("storage"),
+             p.get("graphics"), p.get("display_size"), p.get("condition_text")]
     return " | ".join(str(x) for x in parts if x)
 
 
-# ------------------------------------------------------------------
+def profit_map(sales, items):
+    cost = {}
+    for i in items:
+        cost[i.get("sale_id")] = cost.get(i.get("sale_id"), 0) + num(i.get("purchase_price")) * num(i.get("quantity"))
+    return {s["id"]: num(s.get("total")) - cost[s["id"]] for s in sales if s["id"] in cost}
+
+
+def in_range(s, d1, d2):
+    d = parse_date(s.get("sale_date"))
+    return d is not None and d1 <= d <= d2
+
+
+def zip_bytes(tables):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, rows in tables.items():
+            z.writestr(f"{name}.csv", pd.DataFrame(rows).to_csv(index=False))
+    return buf.getvalue()
+
+
+def adjust_stock(pid, delta):
+    """Add (delta>0) or remove (delta<0) stock safely. Returns True on success."""
+    for _ in range(3):
+        rows = supabase.table("products").select("id,quantity").eq("id", pid).limit(1).execute().data
+        if not rows:
+            return False
+        cur = int(num(rows[0].get("quantity")))
+        new = cur + int(delta)
+        if new < 0:
+            return False
+        done = (
+            supabase.table("products").update({"quantity": new}).eq("id", pid).eq("quantity", cur).execute().data
+        )
+        if done:
+            return True
+    return False
+
+
+# ==================================================================
 # PASSWORDS (same format as the existing users table)
-# ------------------------------------------------------------------
+# ==================================================================
 def password_hash(password):
     salt = secrets.token_hex(16)
-    hashed = hashlib.pbkdf2_hmac(
-        "sha256", password.encode(), salt.encode(), 200000
-    ).hex()
+    hashed = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 200000).hex()
     return salt + "$" + hashed
 
 
 def verify_password(password, saved):
     try:
         salt, digest = saved.split("$", 1)
-        actual = hashlib.pbkdf2_hmac(
-            "sha256", password.encode(), salt.encode(), 200000
-        ).hex()
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 200000).hex()
         return secrets.compare_digest(actual, digest)
     except Exception:
         return False
 
 
-# ------------------------------------------------------------------
-# LOGIN
-# ------------------------------------------------------------------
-def login():
-    st.subheader("🔐 Login")
+# ==================================================================
+# PDF REPORTS (reportlab)
+# ==================================================================
+def build_pdf(title, subtitle, blocks):
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.lib.styles import ParagraphStyle
+        from reportlab.pdfgen import canvas as rl_canvas
+        from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    except ImportError:
+        raise RuntimeError("PDF library missing. Add 'reportlab' to requirements.txt and reboot the app.")
+    from xml.sax.saxutils import escape
 
+    navy, blue, light = colors.HexColor("#0b1f3a"), colors.HexColor("#1f6feb"), colors.HexColor("#f3f6fb")
+    stamp = datetime.now(timezone(timedelta(hours=5))).strftime("%d %b %Y, %I:%M %p")
+
+    class NumberedCanvas(rl_canvas.Canvas):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self._saved = []
+
+        def showPage(self):
+            self._saved.append(dict(self.__dict__))
+            self._startPage()
+
+        def save(self):
+            total = len(self._saved)
+            for state in self._saved:
+                self.__dict__.update(state)
+                w = self._pagesize[0]
+                self.setStrokeColor(colors.HexColor("#cbd5e1"))
+                self.line(28, 30, w - 28, 30)
+                self.setFont("Helvetica", 8)
+                self.setFillColor(colors.HexColor("#64748b"))
+                self.drawString(28, 18, f"Laptop House Buner  |  Generated {stamp}")
+                self.drawRightString(w - 28, 18, f"Page {self.getPageNumber()} of {total}")
+                super().showPage()
+            super().save()
+
+    def header(canv, doc):
+        w, h = doc.pagesize
+        canv.saveState()
+        canv.setFillColor(navy)
+        canv.rect(0, h - 62, w, 62, fill=1, stroke=0)
+        canv.setFillColor(blue)  # logo area: replace this box with your logo if you wish
+        canv.roundRect(28, h - 52, 42, 42, 8, fill=1, stroke=0)
+        canv.setFillColor(colors.white)
+        canv.setFont("Helvetica-Bold", 16)
+        canv.drawCentredString(49, h - 37, "LH")
+        canv.setFont("Helvetica-Bold", 15)
+        canv.drawString(82, h - 30, "LAPTOP HOUSE BUNER")
+        canv.setFont("Helvetica", 8.5)
+        canv.drawString(82, h - 44, "Shop Management System")
+        canv.setFont("Helvetica-Bold", 12)
+        canv.drawRightString(w - 28, h - 30, title)
+        canv.setFont("Helvetica", 8.5)
+        canv.drawRightString(w - 28, h - 44, subtitle)
+        canv.restoreState()
+
+    buf = io.BytesIO()
+    page = landscape(A4)
+    doc = SimpleDocTemplate(buf, pagesize=page, leftMargin=28, rightMargin=28, topMargin=80,
+                            bottomMargin=42, title=title, author="Laptop House Buner")
+    usable = page[0] - 56
+    h_style = ParagraphStyle("h", fontName="Helvetica-Bold", fontSize=12, textColor=navy, spaceBefore=8, spaceAfter=6)
+    p_style = ParagraphStyle("p", fontName="Helvetica", fontSize=9, leading=12, textColor=colors.HexColor("#334155"))
+
+    def cell_styles(right, bold=False, white=False):
+        name = "Helvetica-Bold" if (bold or white) else "Helvetica"
+        return ParagraphStyle("c", fontName=name, fontSize=7.5, leading=9.2, alignment=2 if right else 0,
+                              textColor=colors.white if white else colors.HexColor("#0f172a"))
+
+    story = []
+    for b in blocks:
+        kind = b[0]
+        if kind == "h":
+            story.append(Paragraph(escape(b[1]), h_style))
+        elif kind == "p":
+            story.append(Paragraph(escape(b[1]), p_style))
+            story.append(Spacer(1, 6))
+        elif kind == "kpi":
+            data = [[Paragraph(escape(k), cell_styles(False, bold=True)), Paragraph(escape(v), cell_styles(True, bold=True))]
+                    for k, v in b[1]]
+            t = Table(data, colWidths=[usable * 0.35, usable * 0.2])
+            t.setStyle(TableStyle([
+                ("ROWBACKGROUNDS", (0, 0), (-1, -1), [colors.white, light]),
+                ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#cbd5e1")),
+                ("INNERGRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#e2e8f0")),
+                ("TOPPADDING", (0, 0), (-1, -1), 5), ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ]))
+            story.append(t)
+            story.append(Spacer(1, 8))
+        elif kind == "table":
+            _, head, rows, weights, right, foot = b
+            if not rows:
+                story.append(Paragraph("No records found for this report.", p_style))
+                continue
+            wsum = float(sum(weights))
+            widths = [usable * w / wsum for w in weights]
+            data = [[Paragraph(escape(str(h)), cell_styles(i in right, white=True)) for i, h in enumerate(head)]]
+            for r in rows:
+                data.append([Paragraph(escape(str(c if c is not None else "")), cell_styles(i in right))
+                             for i, c in enumerate(r)])
+            if foot:
+                data.append([Paragraph(escape(str(c)), cell_styles(i in right, bold=True)) for i, c in enumerate(foot)])
+            t = Table(data, colWidths=widths, repeatRows=1)
+            style = [
+                ("BACKGROUND", (0, 0), (-1, 0), navy),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, light]),
+                ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#cbd5e1")),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                ("LEFTPADDING", (0, 0), (-1, -1), 4), ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+            ]
+            if foot:
+                style.append(("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#dbe7fb")))
+            t.setStyle(TableStyle(style))
+            story.append(t)
+            story.append(Spacer(1, 8))
+    doc.build(story, onFirstPage=header, onLaterPages=header, canvasmaker=NumberedCanvas)
+    return buf.getvalue()
+
+
+def inventory_pdf(products):
+    require_admin()
+    units = sum(int(num(p.get("quantity"))) for p in products)
+    buy = sum(num(p.get("purchase_price")) * num(p.get("quantity")) for p in products)
+    sell = sum(num(p.get("selling_price")) * num(p.get("quantity")) for p in products)
+    rows = [[p.get("name"), p.get("category"), p.get("model"), p.get("processor"), p.get("ram"),
+             p.get("storage"), p.get("serial_number"), p.get("condition_text"),
+             int(num(p.get("quantity"))), pkr(p.get("purchase_price")), pkr(p.get("selling_price"))]
+            for p in products]
+    blocks = [
+        ("h", "Inventory Summary"),
+        ("kpi", [("Total number of products", str(len(products))), ("Total stock units", str(units)),
+                 ("Total inventory purchase value", pkr(buy)), ("Total inventory selling value", pkr(sell))]),
+        ("h", "Product List"),
+        ("table", ["Product", "Category", "Model", "Processor", "RAM", "Storage", "Serial No", "Condition",
+                   "Qty", "Purchase", "Selling"], rows, [15, 8, 10, 13, 6, 8, 12, 8, 4, 9, 9], {8, 9, 10}, None),
+    ]
+    return build_pdf("Inventory Report", f"Report date: {today_pk().strftime('%d %b %Y')}", blocks)
+
+
+def sales_pdf(sales, items, d1, d2):
+    require_admin()
+    sales = sorted(active_sales(sales), key=lambda x: x.get("id", 0))
+    by_sale = {}
+    for i in items:
+        by_sale.setdefault(i.get("sale_id"), []).append(i)
+    rows = []
+    for s in sales:
+        for i in by_sale.get(s["id"], [{}]):
+            rows.append([s.get("invoice_no"), str(s.get("sale_date"))[:10], s.get("customer_name"),
+                         s.get("customer_phone"),
+                         f"{i.get('product_name') or ''} {('- ' + i['specs']) if i.get('specs') else ''}".strip(),
+                         int(num(i.get("quantity"))) if i else "", pkr(i.get("selling_price")) if i else "",
+                         pkr(s.get("discount")), pkr(s.get("total")), pkr(s.get("paid_amount")),
+                         pkr(max(num(s.get("total")) - num(s.get("paid_amount")), 0)), s.get("sold_by")])
+    tot = sum(num(s.get("total")) for s in sales)
+    paid = sum(num(s.get("paid_amount")) for s in sales)
+    foot = ["TOTAL", "", "", "", "", "", "", "", pkr(tot), pkr(paid), pkr(max(tot - paid, 0)), ""]
+    blocks = [("p", f"Sales from {d1.strftime('%d %b %Y')} to {d2.strftime('%d %b %Y')}. Cancelled invoices are excluded."),
+              ("table", ["Invoice", "Date", "Customer", "Phone", "Product / Specs", "Qty", "Price", "Discount",
+                         "Total", "Paid", "Balance", "Sold By"], rows,
+               [11, 8, 11, 10, 22, 4, 8, 7, 8, 8, 8, 8], {5, 6, 7, 8, 9, 10}, foot if rows else None)]
+    return build_pdf("Sold Products Report", f"{d1.strftime('%d %b %Y')} - {d2.strftime('%d %b %Y')}", blocks)
+
+
+def summary_pdf(sales, items, d1, d2):
+    require_admin()
+    sales = active_sales(sales)
+    pm = profit_map(sales, items)
+    total = sum(num(s.get("total")) for s in sales)
+    paid = sum(num(s.get("paid_amount")) for s in sales)
+    owing = [s for s in sales if num(s.get("total")) - num(s.get("paid_amount")) > 0.5]
+    perf = {}
+    for s in sales:
+        r = perf.setdefault(s.get("sold_by") or "Unknown", [0, 0.0, 0.0])
+        r[0] += 1
+        r[1] += num(s.get("total"))
+        r[2] += num(s.get("paid_amount"))
+    blocks = [
+        ("h", "Sales Summary"),
+        ("kpi", [("Sales date range", f"{d1.strftime('%d %b %Y')} to {d2.strftime('%d %b %Y')}"),
+                 ("Total invoices", str(len(sales))), ("Total sales", pkr(total)),
+                 ("Total received payments", pkr(paid)),
+                 ("Total remaining balances", pkr(max(total - paid, 0))),
+                 ("Estimated gross profit", pkr(sum(pm.values())))]),
+        ("h", "Staff Sales Performance"),
+        ("table", ["Staff", "Invoices", "Total Sales", "Received"],
+         [[k, v[0], pkr(v[1]), pkr(v[2])] for k, v in sorted(perf.items(), key=lambda kv: -kv[1][1])],
+         [30, 10, 20, 20], {1, 2, 3}, None),
+        ("h", "Customers With Remaining Balance"),
+        ("table", ["Invoice", "Customer", "Phone", "Total", "Paid", "Remaining"],
+         [[s.get("invoice_no"), s.get("customer_name"), s.get("customer_phone"), pkr(s.get("total")),
+           pkr(s.get("paid_amount")), pkr(num(s.get("total")) - num(s.get("paid_amount")))] for s in owing],
+         [16, 22, 16, 14, 14, 14], {3, 4, 5}, None),
+    ]
+    return build_pdf("Sales Summary", f"{d1.strftime('%d %b %Y')} - {d2.strftime('%d %b %Y')}", blocks)
+
+
+# ==================================================================
+# SALE BACKEND OPERATIONS (permission checked in Python)
+# ==================================================================
+def update_sale(sale_id, customer, phone, qty, price, discount, notes):
+    require_admin()
+    sale = supabase.table("sales").select("*").eq("id", sale_id).limit(1).execute().data
+    if not sale:
+        raise ValueError("Sale not found.")
+    sale = sale[0]
+    if sale_status(sale) == "cancelled":
+        raise ValueError("Cancelled sales cannot be edited.")
+    items = supabase.table("sale_items").select("*").eq("sale_id", sale_id).execute().data or []
+    upd = {"customer_name": customer.strip(), "customer_phone": phone.strip()}
+    if col_exists("sales", "notes"):
+        upd["notes"] = notes.strip()
+
+    stock_changed, item_changed, old_item = 0, False, None
+    try:
+        if len(items) == 1:
+            it = items[0]
+            old_item = it
+            old_qty = int(num(it.get("quantity")))
+            subtotal = price * qty
+            if discount > subtotal:
+                raise ValueError("Discount cannot be more than the subtotal.")
+            total = subtotal - discount
+            if total < num(sale.get("paid_amount")) - 0.5:
+                raise ValueError("New total is less than the amount already paid. Cancel the sale instead.")
+            delta = int(qty) - old_qty
+            if delta != 0:
+                if not it.get("product_id") or not adjust_stock(it["product_id"], -delta):
+                    raise ValueError("Not enough stock (or product missing) for this quantity change.")
+                stock_changed = delta
+            supabase.table("sale_items").update({"quantity": int(qty), "selling_price": price}).eq("id", it["id"]).execute()
+            item_changed = True
+            upd.update({"total": total, "discount": discount})
+        supabase.table("sales").update(upd).eq("id", sale_id).execute()
+    except Exception:
+        try:  # roll back
+            if item_changed and old_item:
+                supabase.table("sale_items").update(
+                    {"quantity": old_item.get("quantity"), "selling_price": old_item.get("selling_price")}
+                ).eq("id", old_item["id"]).execute()
+            if stock_changed and old_item:
+                adjust_stock(old_item["product_id"], stock_changed)
+        except Exception:
+            pass
+        raise
+
+
+def restore_stock_for_sale(sale_id):
+    """Put sold units back into stock. Returns number of items that could not be restored."""
+    missing = 0
+    items = supabase.table("sale_items").select("*").eq("sale_id", sale_id).execute().data or []
+    for it in items:
+        if not (it.get("product_id") and adjust_stock(it["product_id"], int(num(it.get("quantity"))))):
+            missing += 1
+    return missing
+
+
+def cancel_sale(sale_id, reason):
+    require_admin()
+    if not col_exists("sales", "status"):
+        raise ValueError("Cancel needs the 'status' column. Run the SQL migration first.")
+    sale = supabase.table("sales").select("*").eq("id", sale_id).limit(1).execute().data
+    if not sale:
+        raise ValueError("Sale not found.")
+    if sale_status(sale[0]) == "cancelled":
+        raise ValueError("This sale is already cancelled.")
+    missing = restore_stock_for_sale(sale_id)
+    upd = {"status": "cancelled"}
+    if col_exists("sales", "cancelled_at"):
+        upd["cancelled_at"] = datetime.now(timezone.utc).isoformat()
+    if col_exists("sales", "cancel_reason"):
+        upd["cancel_reason"] = reason.strip()
+    supabase.table("sales").update(upd).eq("id", sale_id).execute()
+    return missing
+
+
+def delete_sale_full(sale_id):
+    """Permanently delete one invoice (stock restored first unless already cancelled)."""
+    require_admin()
+    sale = supabase.table("sales").select("*").eq("id", sale_id).limit(1).execute().data
+    if not sale:
+        return 0
+    missing = 0 if sale_status(sale[0]) == "cancelled" else restore_stock_for_sale(sale_id)
+    supabase.table("payments").delete().eq("sale_id", sale_id).execute()
+    supabase.table("sale_items").delete().eq("sale_id", sale_id).execute()
+    supabase.table("sales").delete().eq("id", sale_id).execute()
+    return missing
+
+
+def reset_sale_payments(sale_id):
+    require_admin()
+    supabase.table("payments").delete().eq("sale_id", sale_id).execute()
+    supabase.table("sales").update({"paid_amount": 0}).eq("id", sale_id).execute()
+
+
+def reset_products(ids, fields):
+    require_admin()
+    upd = {}
+    if "Stock quantity → 0" in fields:
+        upd["quantity"] = 0
+    if "Purchase and selling price → 0" in fields:
+        upd["purchase_price"] = 0
+        upd["selling_price"] = 0
+    if "Serial number → blank" in fields:
+        upd["serial_number"] = ""
+    if "Warranty days → 0" in fields:
+        upd["warranty_days"] = 0
+    if "Warranty terms → blank" in fields and col_exists("products", "warranty_terms"):
+        upd["warranty_terms"] = ""
+    if not upd:
+        raise ValueError("Nothing to reset for the chosen options.")
+    for pid in ids:
+        supabase.table("products").update(upd).eq("id", pid).execute()
+
+
+# ==================================================================
+# LOGIN
+# ==================================================================
+def login():
+    st.markdown(
+        '<div class="login-card"><h2>💻 Laptop House Buner</h2><p>Shop Management System</p></div>',
+        unsafe_allow_html=True,
+    )
     if st.session_state.get("failed_logins", 0) >= 5:
         st.error("Too many failed attempts. Refresh the page to try again.")
         return
-
-    with st.form("login"):
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        submit = st.form_submit_button("Login")
-
+    _, mid, _ = st.columns([1, 2, 1])
+    with mid:
+        with st.form("login"):
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            submit = st.form_submit_button("🔐 Login", type="primary")
     if submit:
         try:
-            users = (
-                supabase.table("users")
-                .select("*")
-                .eq("username", username.strip())
-                .limit(1)
-                .execute()
-                .data
-            )
+            users = supabase.table("users").select("*").eq("username", username.strip()).limit(1).execute().data
             if users and verify_password(password, users[0].get("password_hash", "")):
-                st.session_state.user = {
-                    "id": users[0].get("id"),
-                    "username": users[0].get("username"),
-                    "role": users[0].get("role", "staff"),
-                }
+                st.session_state.user = {"id": users[0].get("id"), "username": users[0].get("username"),
+                                         "role": users[0].get("role", "staff")}
                 st.session_state.failed_logins = 0
                 st.rerun()
             else:
-                st.session_state.failed_logins = (
-                    st.session_state.get("failed_logins", 0) + 1
-                )
+                st.session_state.failed_logins = st.session_state.get("failed_logins", 0) + 1
                 st.error("Incorrect username or password.")
         except Exception as e:
             st.error(f"Login error: {e}")
 
 
-# ------------------------------------------------------------------
-# HISTORY BUILDER (used by Sales History)
-# ------------------------------------------------------------------
-def build_history(sales, items, admin):
-    items_by_sale = {}
-    for it in items:
-        items_by_sale.setdefault(it.get("sale_id"), []).append(it)
-
-    rows = []
-    for s in sorted(sales, key=lambda x: x.get("id", 0), reverse=True):
-        total = num(s.get("total"))
-        paid = num(s.get("paid_amount"))
-        discount = num(s.get("discount"))
-        sale_items = items_by_sale.get(s.get("id"), [])
-        subtotal = sum(num(i.get("selling_price")) * num(i.get("quantity")) for i in sale_items)
-
-        base = {
-            "Invoice No": s.get("invoice_no"),
-            "Customer": s.get("customer_name"),
-            "Phone": s.get("customer_phone"),
-            "Date": s.get("sale_date"),
-            "Sold By": s.get("sold_by"),
-        }
-
-        if not sale_items:
-            row = dict(base)
-            row.update(
-                {
-                    "Product": "",
-                    "Specs": "",
-                    "Qty": 0,
-                    "Selling Price": 0,
-                    "Total": total,
-                    "Paid": paid,
-                    "Remaining": max(total - paid, 0),
-                }
-            )
-            if admin:
-                row["Purchase Price"] = 0
-                row["Profit"] = 0
-            rows.append(row)
-            continue
-
-        for i in sale_items:
-            qty = num(i.get("quantity"))
-            sp = num(i.get("selling_price"))
-            row = dict(base)
-            row.update(
-                {
-                    "Product": i.get("product_name"),
-                    "Specs": i.get("specs"),
-                    "Qty": int(qty),
-                    "Selling Price": sp,
-                    "Total": total,
-                    "Paid": paid,
-                    "Remaining": max(total - paid, 0),
-                }
-            )
-            if admin:
-                pp = num(i.get("purchase_price"))
-                share = (sp * qty / subtotal) if subtotal else 0
-                row["Purchase Price"] = pp
-                row["Profit"] = round(sp * qty - pp * qty - discount * share, 2)
-            rows.append(row)
-
-    return pd.DataFrame(rows)
-
-
-# ------------------------------------------------------------------
+# ==================================================================
 # DASHBOARD
-# ------------------------------------------------------------------
+# ==================================================================
 def dashboard():
-    st.subheader("🏠 Dashboard")
+    page_header("🏠", "Dashboard", f"Welcome, {current_username()} — {today_pk().strftime('%A, %d %B %Y')}")
+    admin = is_admin()
+    with st.expander("⚙️ Dashboard settings"):
+        d1, d2 = st.columns(2)
+        period = d1.selectbox("Sales period", PERIODS, key="set_period")
+        low_limit = d2.number_input("Low-stock limit (units)", min_value=0, value=3, step=1, key="set_low_stock")
 
-    products = load_products()
-    sales = get_data("sales")
+    with st.spinner("Loading dashboard..."):
+        products = load_products()
+        sales = active_sales(get_data("sales"))
+    if period != "All time":
+        days = {"Today": 0, "Last 7 days": 6, "Last 30 days": 29}[period]
+        start = today_pk() - timedelta(days=days)
+        sales = [s for s in sales if (parse_date(s.get("sale_date")) or date.min) >= start]
 
-    total_stock = sum(int(num(p.get("quantity"))) for p in products)
-    today_str = today_pk().isoformat()
-    today_sales = [s for s in sales if str(s.get("sale_date", ""))[:10] == today_str]
-
-    if is_admin():
-        total_sales = sum(num(s.get("total")) for s in sales)
+    stock = sum(int(num(p.get("quantity"))) for p in products)
+    if admin:
+        total = sum(num(s.get("total")) for s in sales)
         pending = sum(max(num(s.get("total")) - num(s.get("paid_amount")), 0) for s in sales)
-
-        a, b, c, d = st.columns(4)
-        a.metric("Total Products", len(products))
-        b.metric("Stock Units", total_stock)
-        c.metric("Total Sales", pkr(total_sales))
-        d.metric("Pending Balances", pkr(pending))
-
-        e, f, g = st.columns(3)
-        e.metric("Invoices", len(sales))
-        f.metric("Today's Invoices", len(today_sales))
-        g.metric("Today's Sales", pkr(sum(num(s.get("total")) for s in today_sales)))
+        cards([("📦", "Total Products", len(products), "#1f6feb"), ("🧮", "Stock Units", stock, "#7c3aed"),
+               ("💰", f"Sales ({period})", pkr(total), "#12b76a"), ("⏳", "Pending Balances", pkr(pending), "#f79009"),
+               ("🧾", "Invoices", len(sales), "#0ea5e9")])
     else:
         mine = [s for s in sales if s.get("sold_by") == current_username()]
-        mine_today = [s for s in today_sales if s.get("sold_by") == current_username()]
-        a, b, c, d = st.columns(4)
-        a.metric("Total Products", len(products))
-        b.metric("Stock Units", total_stock)
-        c.metric("My Invoices", len(mine))
-        d.metric("My Sales Today", pkr(sum(num(s.get("total")) for s in mine_today)))
+        cards([("📦", "Total Products", len(products), "#1f6feb"), ("🧮", "Stock Units", stock, "#7c3aed"),
+               ("🧾", f"My Invoices ({period})", len(mine), "#0ea5e9"),
+               ("💰", "My Sales", pkr(sum(num(s.get("total")) for s in mine)), "#12b76a")])
 
-    st.markdown("### ⚠️ Low Stock (3 or fewer)")
-    low = [p for p in products if 0 <= int(num(p.get("quantity"))) <= 3]
-    if low:
-        show_table(
-            pd.DataFrame(
-                [
-                    {
-                        "Product": p.get("name"),
-                        "Model": p.get("model"),
-                        "Quantity": int(num(p.get("quantity"))),
-                    }
-                    for p in low
-                ]
-            )
-        )
-    else:
-        st.success("No low-stock products.")
-
-    st.markdown("### 🕒 Recent Sales")
-    recent = sorted(sales, key=lambda x: x.get("id", 0), reverse=True)[:8]
-    if recent:
-        show_table(
-            pd.DataFrame(
-                [
-                    {
-                        "Invoice": s.get("invoice_no"),
-                        "Customer": s.get("customer_name"),
-                        "Date": s.get("sale_date"),
-                        "Sold By": s.get("sold_by"),
-                        "Total": pkr(s.get("total")),
-                        "Remaining": pkr(max(num(s.get("total")) - num(s.get("paid_amount")), 0)),
-                    }
-                    for s in recent
-                ]
-            )
-        )
-    else:
-        st.info("No sales yet.")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown(f"### ⚠️ Low Stock (≤ {int(low_limit)})")
+        low = [p for p in products if int(num(p.get("quantity"))) <= int(low_limit)]
+        if low:
+            show_table(pd.DataFrame([{"Product": p.get("name"), "Model": p.get("model"),
+                                      "Qty": int(num(p.get("quantity")))} for p in low]))
+        else:
+            empty_state("✅", "Stock looks good", "No products are below your low-stock limit.")
+    with c2:
+        st.markdown("### 🕒 Recent Sales")
+        recent = sorted(sales, key=lambda x: x.get("id", 0), reverse=True)[:8]
+        if recent:
+            show_table(pd.DataFrame([{"Invoice": s.get("invoice_no"), "Customer": s.get("customer_name"),
+                                      "Date": s.get("sale_date"), "Total": pkr(s.get("total")),
+                                      "Balance": pkr(max(num(s.get("total")) - num(s.get("paid_amount")), 0))}
+                                     for s in recent]))
+        else:
+            empty_state("🧾", "No sales yet", "Completed sales will appear here.")
 
 
-# ------------------------------------------------------------------
+# ==================================================================
 # PRODUCTS & STOCK
-# ------------------------------------------------------------------
-def products_page():
-    st.subheader("📦 Products & Stock")
+# ==================================================================
+def option_index(options, value):
+    return options.index(value) if value in options else 0
 
-    admin = is_admin()
-    products = load_products()
 
-    if products:
-        search = st.text_input("🔍 Search products (name, model, processor, serial)")
-        rows = []
-        for p in products:
-            text = " ".join(
-                str(p.get(k, "")) for k in ("name", "model", "processor", "serial_number", "ram", "storage")
-            ).lower()
-            if search.strip() and search.strip().lower() not in text:
-                continue
-            row = {
-                "ID": p.get("id"),
-                "Product": p.get("name"),
-                "Category": p.get("category"),
-                "Model": p.get("model"),
-                "Processor": p.get("processor"),
-                "RAM": p.get("ram"),
-                "Storage": p.get("storage"),
-                "Graphics": p.get("graphics"),
-                "Display": p.get("display_size"),
-                "Condition": p.get("condition_text"),
-                "Serial No": p.get("serial_number"),
-            }
-            if admin:
-                row["Purchase Price"] = num(p.get("purchase_price"))
-            row["Selling Price"] = num(p.get("selling_price"))
-            row["Qty"] = int(num(p.get("quantity")))
-            row["Warranty Days"] = int(num(p.get("warranty_days")))
-            row["Warranty Terms"] = p.get("warranty_terms")
-            rows.append(row)
-        df = pd.DataFrame(rows)
-        # hide columns that are completely empty (e.g. columns not in database yet)
-        df = df.dropna(axis=1, how="all")
-        show_table(df)
-    else:
-        st.info("No products added yet.")
-
-    if not admin:
+def inventory_view(products, admin):
+    if not products:
+        empty_state("📦", "No products yet", "Products added by the Owner will appear here.")
         return
+    search = st.text_input("🔍 Search (name, model, processor, serial)", key="flt_prod_search")
+    rows = []
+    for p in products:
+        text = " ".join(str(p.get(k, "")) for k in ("name", "model", "processor", "serial_number", "ram", "storage")).lower()
+        if search.strip() and search.strip().lower() not in text:
+            continue
+        row = {"ID": p.get("id"), "Product": p.get("name"), "Category": p.get("category"), "Model": p.get("model"),
+               "Processor": p.get("processor"), "RAM": p.get("ram"), "Storage": p.get("storage"),
+               "Graphics": p.get("graphics"), "Display": p.get("display_size"), "Condition": p.get("condition_text"),
+               "Serial No": p.get("serial_number")}
+        if admin:
+            row["Purchase Price"] = num(p.get("purchase_price"))
+        row["Selling Price"] = num(p.get("selling_price"))
+        row["Qty"] = int(num(p.get("quantity")))
+        row["Warranty Days"] = int(num(p.get("warranty_days")))
+        row["Warranty Terms"] = p.get("warranty_terms")
+        rows.append(row)
+    df = pd.DataFrame(rows).dropna(axis=1, how="all") if rows else pd.DataFrame()
+    if df.empty:
+        empty_state("🔍", "No match", "No product matches your search.")
+    else:
+        show_table(df)
 
-    st.divider()
 
-    # ---------------- ADD PRODUCT ----------------
+def product_form_fields(prefix, p=None):
+    p = p or {}
+    c1, c2, c3 = st.columns(3)
+    name = c1.text_input("Product Name", value=p.get("name") or "", key=f"{prefix}_name")
+    cats = CATEGORIES + ([p["category"]] if p.get("category") and p["category"] not in CATEGORIES else [])
+    category = c2.selectbox("Category", cats, index=option_index(cats, p.get("category")), key=f"{prefix}_cat")
+    model = c3.text_input("Model", value=p.get("model") or "", key=f"{prefix}_model")
+    c4, c5, c6 = st.columns(3)
+    processor = c4.text_input("Processor", value=p.get("processor") or "", key=f"{prefix}_cpu")
+    ram = c5.text_input("RAM", value=p.get("ram") or "", key=f"{prefix}_ram")
+    storage = c6.text_input("Storage", value=p.get("storage") or "", key=f"{prefix}_sto")
+    c7, c8, c9 = st.columns(3)
+    graphics = c7.text_input("Graphics", value=p.get("graphics") or "", key=f"{prefix}_gpu")
+    display = c8.text_input("Display Size", value=p.get("display_size") or "", key=f"{prefix}_disp")
+    conds = CONDITIONS + ([p["condition_text"]] if p.get("condition_text") and p["condition_text"] not in CONDITIONS else [])
+    condition = c9.selectbox("Condition", conds, index=option_index(conds, p.get("condition_text")), key=f"{prefix}_cond")
+    serial = st.text_input("Serial Number", value=p.get("serial_number") or "", key=f"{prefix}_serial")
+    c10, c11, c12, c13 = st.columns(4)
+    purchase = c10.number_input("Purchase Price (Rs)", min_value=0.0, step=500.0, value=num(p.get("purchase_price")), key=f"{prefix}_pp")
+    selling = c11.number_input("Selling Price (Rs)", min_value=0.0, step=500.0, value=num(p.get("selling_price")), key=f"{prefix}_sp")
+    qty = c12.number_input("Quantity", min_value=0, step=1, value=int(num(p.get("quantity"))), key=f"{prefix}_qty")
+    warranty = c13.number_input("Warranty Days", min_value=0, step=1, value=int(num(p.get("warranty_days"))), key=f"{prefix}_wd")
+    terms = st.text_area("Warranty Terms", value=p.get("warranty_terms") or "", key=f"{prefix}_wt")
+    base = {"name": name.strip(), "category": category, "model": model.strip(), "processor": processor.strip(),
+            "ram": ram.strip(), "storage": storage.strip(), "condition_text": condition, "serial_number": serial.strip(),
+            "purchase_price": purchase, "selling_price": selling, "quantity": int(qty), "warranty_days": int(warranty)}
+    extras = {"graphics": graphics.strip(), "display_size": display.strip(), "warranty_terms": terms.strip()}
+    return base, extras
+
+
+def validate_product(base, products, own_id=None):
+    if not base["name"]:
+        return "Product name is required."
+    if base["selling_price"] < base["purchase_price"]:
+        return "Selling price is lower than purchase price. Please check the prices."
+    sn = base["serial_number"].lower()
+    if sn and any(str(p.get("serial_number", "")).strip().lower() == sn and p["id"] != own_id for p in products):
+        return "Another product already uses this serial number."
+    return None
+
+
+def add_product_tab(products):
     with st.form("add_product", clear_on_submit=True):
         st.markdown("### ➕ Add New Product")
-        c1, c2, c3 = st.columns(3)
-        name = c1.text_input("Product Name")
-        category = c2.selectbox("Category", ["Laptop", "Accessories", "Desktop", "Other"])
-        model = c3.text_input("Model")
-
-        c4, c5, c6 = st.columns(3)
-        processor = c4.text_input("Processor")
-        ram = c5.text_input("RAM")
-        storage = c6.text_input("Storage")
-
-        c7, c8, c9 = st.columns(3)
-        graphics = c7.text_input("Graphics")
-        display_size = c8.text_input("Display Size")
-        condition = c9.selectbox("Condition", ["Used", "New", "Refurbished"])
-
-        serial = st.text_input("Serial Number")
-
-        c10, c11, c12, c13 = st.columns(4)
-        purchase = c10.number_input("Purchase Price (Rs)", min_value=0.0, step=500.0)
-        selling = c11.number_input("Selling Price (Rs)", min_value=0.0, step=500.0)
-        quantity = c12.number_input("Quantity", min_value=0, step=1)
-        warranty = c13.number_input("Warranty Days", min_value=0, step=1)
-
-        warranty_terms = st.text_area("Warranty Terms")
-        submit = st.form_submit_button("💾 Save Product")
-
+        base, extras = product_form_fields("add")
+        submit = st.form_submit_button("💾 Save Product", type="primary")
     if submit:
-        if not name.strip():
-            st.error("Product name is required.")
-        elif selling < purchase:
-            st.error("Selling price is lower than purchase price. Please check the prices.")
-        elif serial.strip() and any(
-            str(p.get("serial_number", "")).strip().lower() == serial.strip().lower()
-            for p in products
-        ):
-            st.error("A product with this serial number already exists.")
-        else:
-            base = {
-                "name": name.strip(),
-                "category": category,
-                "model": model.strip(),
-                "processor": processor.strip(),
-                "ram": ram.strip(),
-                "storage": storage.strip(),
-                "condition_text": condition,
-                "serial_number": serial.strip(),
-                "purchase_price": purchase,
-                "selling_price": selling,
-                "quantity": int(quantity),
-                "warranty_days": int(warranty),
-            }
-            full = dict(base)
-            full.update(
-                {
-                    "graphics": graphics.strip(),
-                    "display_size": display_size.strip(),
-                    "warranty_terms": warranty_terms.strip(),
-                }
-            )
+        try:
+            require_admin()
+            err = validate_product(base, products)
+            if err:
+                st.error(err)
+                return
+            data, skipped = with_optional("products", base, extras)
+            supabase.table("products").insert(data).execute()
+            msg = "Product saved successfully."
+            if skipped:
+                msg += f" (Not saved because columns are missing in Supabase: {', '.join(skipped)} — see the SQL migration.)"
+            flash("success", msg)
+            st.rerun()
+        except PermissionError as e:
+            st.error(str(e))
+        except Exception as e:
+            st.error(f"Save failed: {e}")
+
+
+def edit_delete_tab(products):
+    if not products:
+        empty_state("✏️", "Nothing to edit", "Add a product first.")
+        return
+    ids = [p["id"] for p in products]
+    labels = {p["id"]: f'#{p["id"]} - {p.get("name")} {p.get("model") or ""} (Stock {int(num(p.get("quantity")))})' for p in products}
+    pid = st.selectbox("Select product", ids, format_func=lambda i: labels[i], key="edit_pid")
+    p = next(x for x in products if x["id"] == pid)
+
+    with st.form(f"edit_form_{pid}"):
+        st.markdown("### ✏️ Edit Product")
+        base, extras = product_form_fields(f"ed{pid}", p)
+        save = st.form_submit_button("💾 Save Changes", type="primary")
+    if save:
+        try:
+            require_admin()
+            err = validate_product(base, products, own_id=pid)
+            if err:
+                st.error(err)
+            else:
+                data, skipped = with_optional("products", base, extras)
+                supabase.table("products").update(data).eq("id", pid).execute()
+                msg = "Product updated."
+                if skipped:
+                    msg += f" (Columns missing in Supabase, not saved: {', '.join(skipped)}.)"
+                flash("success", msg)
+                st.rerun()
+        except PermissionError as e:
+            st.error(str(e))
+        except Exception as e:
+            st.error(f"Update failed: {e}")
+
+    st.markdown("### 🗑️ Delete Product")
+    linked = supabase.table("sale_items").select("id").eq("product_id", pid).limit(1).execute().data
+    st.download_button("⬇️ Download this product (backup CSV)", pd.DataFrame([p]).to_csv(index=False),
+                       file_name=f"product_{pid}.csv", mime="text/csv", key=f"bk_{pid}")
+    if linked:
+        st.warning("This product is linked to existing sales, so it cannot be deleted (this protects your sales records). "
+                   "Safe option: retire it by setting its stock to 0.")
+        ok = st.checkbox("I want to retire this product (set stock to 0)", key=f"ret_c_{pid}")
+        if st.button("Retire Product", disabled=not ok, key=f"ret_b_{pid}"):
             try:
-                _, all_saved = insert_with_fallback("products", full, base)
-                st.session_state.flash = (
-                    "success",
-                    "Product saved successfully."
-                    if all_saved
-                    else "Product saved, but Graphics / Display Size / Warranty Terms were NOT "
-                    "saved because those columns are missing in Supabase. "
-                    "See the optional SQL in the setup instructions.",
-                )
+                require_admin()
+                supabase.table("products").update({"quantity": 0}).eq("id", pid).execute()
+                flash("success", "Product retired (stock set to 0). Sales records are untouched.")
                 st.rerun()
             except Exception as e:
-                st.error(f"Save failed: {e}")
-
-    # ---------------- EDIT / DELETE ----------------
-    if products:
-        st.divider()
-        st.markdown("### ✏️ Edit Product Price / Stock")
-        ids = [p["id"] for p in products]
-        labels = {
-            p["id"]: f'#{p["id"]} - {p.get("name")} {p.get("model") or ""} (Stock {int(num(p.get("quantity")))})'
-            for p in products
-        }
-        pid = st.selectbox("Select product", ids, format_func=lambda i: labels[i], key="edit_pid")
-        p = next(x for x in products if x["id"] == pid)
-
-        e1, e2, e3 = st.columns(3)
-        new_purchase = e1.number_input(
-            "Purchase Price (Rs)", min_value=0.0, value=num(p.get("purchase_price")),
-            step=500.0, key=f"ep_{pid}",
-        )
-        new_selling = e2.number_input(
-            "Selling Price (Rs)", min_value=0.0, value=num(p.get("selling_price")),
-            step=500.0, key=f"es_{pid}",
-        )
-        new_qty = e3.number_input(
-            "Quantity", min_value=0, value=int(num(p.get("quantity"))),
-            step=1, key=f"eq_{pid}",
-        )
-
-        if st.button("Update Product"):
+                st.error(f"Failed: {e}")
+    else:
+        st.warning(f"You are about to permanently delete: **{p.get('name')}**. This cannot be undone.")
+        ok = st.checkbox("Yes, I want to delete this product", key=f"del_c_{pid}")
+        if st.button("Delete Product", disabled=not ok, key=f"del_b_{pid}"):
             try:
-                supabase.table("products").update(
-                    {
-                        "purchase_price": new_purchase,
-                        "selling_price": new_selling,
-                        "quantity": int(new_qty),
-                    }
-                ).eq("id", pid).execute()
-                st.session_state.flash = ("success", "Product updated.")
+                require_admin()
+                supabase.table("products").delete().eq("id", pid).execute()
+                flash("success", "Product deleted.")
                 st.rerun()
             except Exception as e:
-                st.error(f"Update failed: {e}")
-
-        with st.expander("🗑️ Delete this product"):
-            st.warning("This cannot be undone. Products that already appear in sales may not be deletable.")
-            confirm = st.checkbox("I understand and want to delete this product", key=f"del_c_{pid}")
-            if st.button("Delete Product", disabled=not confirm):
-                try:
-                    supabase.table("products").delete().eq("id", pid).execute()
-                    st.session_state.flash = ("success", "Product deleted.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Delete failed (it may be linked to sales): {e}")
+                st.error(f"Delete failed: {e}")
 
 
-# ------------------------------------------------------------------
+def products_page():
+    page_header("📦", "Products & Stock", "Inventory, specifications and prices")
+    admin = is_admin()
+    products = load_products()
+    if not admin:
+        inventory_view(products, False)
+        return
+    t1, t2, t3 = st.tabs(["📋 Inventory", "➕ Add Product", "✏️ Edit / Delete"])
+    with t1:
+        inventory_view(products, True)
+    with t2:
+        add_product_tab(products)
+    with t3:
+        edit_delete_tab(products)
+
+
+# ==================================================================
 # NEW SALE / BILLING
-# ------------------------------------------------------------------
-def build_receipt(sale_info):
-    lines = [
-        "LAPTOP HOUSE BUNER",
-        "=" * 40,
-        f"Invoice : {sale_info['invoice']}",
-        f"Date    : {sale_info['date']}",
-        f"Customer: {sale_info['customer']}",
-        f"Phone   : {sale_info['phone']}",
-        f"Sold By : {sale_info['sold_by']}",
-        "-" * 40,
-        f"Product : {sale_info['product']}",
-        f"Specs   : {sale_info['specs']}",
-        f"Qty     : {sale_info['qty']}",
-        f"Price   : {pkr(sale_info['price'])}",
-        f"Subtotal: {pkr(sale_info['subtotal'])}",
-        f"Discount: {pkr(sale_info['discount'])}",
-        f"TOTAL   : {pkr(sale_info['total'])}",
-        f"Paid    : {pkr(sale_info['paid'])} ({sale_info['method']})",
-        f"Balance : {pkr(sale_info['balance'])}",
-        f"Warranty: {sale_info['warranty_days']} days (until {sale_info['warranty_expiry']})",
-        "-" * 40,
-        f"Notes   : {sale_info['notes']}",
-        "",
-        "Thank you for shopping with us!",
-    ]
-    return "\n".join(lines)
+# ==================================================================
+def build_receipt(r):
+    return "\n".join([
+        "LAPTOP HOUSE BUNER", "=" * 40, f"Invoice : {r['invoice']}", f"Date    : {r['date']}",
+        f"Customer: {r['customer']}", f"Phone   : {r['phone']}", f"Sold By : {r['sold_by']}", "-" * 40,
+        f"Product : {r['product']}", f"Specs   : {r['specs']}", f"Qty     : {r['qty']}",
+        f"Price   : {pkr(r['price'])}", f"Subtotal: {pkr(r['subtotal'])}", f"Discount: {pkr(r['discount'])}",
+        f"TOTAL   : {pkr(r['total'])}", f"Paid    : {pkr(r['paid'])} ({r['method']})",
+        f"Balance : {pkr(r['balance'])}", f"Warranty: {r['warranty_days']} days (until {r['warranty_expiry']})",
+        "-" * 40, f"Notes   : {r['notes']}", "", "Thank you for shopping with us!"])
 
 
 def billing_page():
-    st.subheader("🧾 New Sale / Billing")
+    page_header("🧾", "New Sale / Billing", "Create a customer bill")
     admin = is_admin()
 
-    # show receipt of the last completed sale
     last = st.session_state.get("last_receipt")
     if last:
-        st.success(f"Sale completed. Invoice number: {last['invoice']}")
+        st.markdown(
+            '<div class="ok-wrap"><svg viewBox="0 0 52 52"><circle class="ok-c" cx="26" cy="26" r="24"/>'
+            '<path class="ok-p" d="M14 27l8 8 16-18"/></svg><div><div class="t1">Sale completed!</div>'
+            f'<div class="t2">Invoice number: <b>{last["invoice"]}</b></div></div></div>', unsafe_allow_html=True)
         st.code(build_receipt(last))
-        st.download_button(
-            "⬇️ Download Invoice (text file)",
-            data=build_receipt(last),
-            file_name=f"{last['invoice']}.txt",
-            mime="text/plain",
-        )
-        if st.button("Start another sale"):
+        st.download_button("⬇️ Download Invoice (text file)", build_receipt(last),
+                           file_name=f"{last['invoice']}.txt", mime="text/plain")
+        if st.button("➕ Start another sale", type="primary"):
             st.session_state.last_receipt = None
             st.rerun()
         return
 
     products = [p for p in load_products() if int(num(p.get("quantity"))) > 0]
     if not products:
-        st.warning("No products in stock. Add products first in Products & Stock.")
+        empty_state("📦", "No stock available", "Add products or stock first in Products & Stock.")
         return
 
     nonce = st.session_state.setdefault("sale_nonce", 0)
     by_id = {p["id"]: p for p in products}
     ids = list(by_id)
-    labels = {
-        p["id"]: f'{p.get("name")} | {p.get("model") or "-"} | {p.get("ram") or "-"}/{p.get("storage") or "-"} '
-        f'| {pkr(p.get("selling_price"))} | Stock {int(num(p.get("quantity")))}'
-        for p in products
-    }
+    labels = {p["id"]: f'{p.get("name")} | {p.get("model") or "-"} | {p.get("ram") or "-"}/{p.get("storage") or "-"} '
+                       f'| {pkr(p.get("selling_price"))} | Stock {int(num(p.get("quantity")))}' for p in products}
 
     st.markdown("#### 👤 Customer")
     c1, c2 = st.columns(2)
@@ -631,72 +962,53 @@ def billing_page():
     pid = st.selectbox("Select Product", ids, format_func=lambda i: labels[i], key=f"prod_{nonce}")
     product = by_id[pid]
     stock = int(num(product.get("quantity")))
-
-    st.info(
-        f"**Specifications:** {spec_text(product) or 'Not provided'}  \n"
-        f"**Serial No:** {product.get('serial_number') or '-'}  \n"
-        f"**Warranty:** {int(num(product.get('warranty_days')))} days"
-    )
+    st.info(f"**Specifications:** {spec_text(product) or 'Not provided'}  \n"
+            f"**Serial No:** {product.get('serial_number') or '-'}  \n"
+            f"**Warranty:** {int(num(product.get('warranty_days')))} days")
 
     q1, q2, q3 = st.columns(3)
-    quantity = q1.number_input(
-        "Quantity", min_value=1, max_value=stock, value=1, step=1, key=f"qty_{nonce}_{pid}"
-    )
+    quantity = q1.number_input("Quantity", min_value=1, max_value=stock, value=1, step=1, key=f"qty_{nonce}_{pid}")
     list_price = num(product.get("selling_price"))
     if admin:
-        price = q2.number_input(
-            "Selling Price (Rs)", min_value=0.0, value=list_price, step=500.0,
-            key=f"price_{nonce}_{pid}",
-        )
+        price = q2.number_input("Selling Price (Rs)", min_value=0.0, value=list_price, step=500.0, key=f"price_{nonce}_{pid}")
     else:
         price = list_price
         q2.number_input("Selling Price (Rs)", value=list_price, disabled=True, key=f"price_ro_{nonce}_{pid}")
-
     subtotal = price * quantity
-    discount = q3.number_input(
-        "Discount (Rs)", min_value=0.0, max_value=float(subtotal), value=0.0, step=100.0,
-        key=f"disc_{nonce}_{pid}_{quantity}",
-    )
+    discount = q3.number_input("Discount (Rs)", min_value=0.0, max_value=float(subtotal), value=0.0, step=100.0,
+                               key=f"disc_{nonce}_{pid}_{quantity}")
     total = subtotal - discount
 
     st.markdown("#### 💳 Payment")
     p1, p2 = st.columns(2)
-    paid = p1.number_input(
-        "Paid Amount (Rs)", min_value=0.0, max_value=float(total), value=float(total), step=500.0,
-        key=f"paid_{nonce}_{int(total * 100)}",
-    )
+    paid = p1.number_input("Paid Amount (Rs)", min_value=0.0, max_value=float(total), value=float(total), step=500.0,
+                           key=f"paid_{nonce}_{int(total * 100)}")
     method = p2.selectbox("Payment Method", PAYMENT_METHODS, key=f"method_{nonce}")
     notes = st.text_area("Notes", key=f"notes_{nonce}")
-
     balance = total - paid
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Subtotal", pkr(subtotal))
-    m2.metric("Total Amount", pkr(total))
-    m3.metric("Remaining Balance", pkr(balance))
-
+    cards([("🧮", "Subtotal", pkr(subtotal), "#1f6feb"), ("💰", "Total Amount", pkr(total), "#12b76a"),
+           ("⏳", "Remaining Balance", pkr(balance), "#f79009")])
     confirm = st.checkbox("✅ I have checked the customer, product and amount", key=f"confirm_{nonce}")
 
-    if st.button("💾 Complete Sale", type="primary", disabled=not confirm):
-        if not customer.strip():
-            st.error("Customer name is required.")
-            return
-        if not phone.strip():
-            st.error("Customer phone is required.")
-            return
+    if not st.button("💾 Complete Sale", type="primary", disabled=not confirm):
+        return
+    if not customer.strip() or not phone.strip():
+        st.error("Customer name and phone are required.")
+        return
+    try:
+        require_login()
+    except Exception as e:
+        st.error(str(e))
+        return
 
-        # duplicate protection: same sale within 60 seconds
-        fingerprint = (customer.strip().lower(), phone.strip(), pid, int(quantity), round(total, 2))
-        last_fp = st.session_state.get("last_fp")
-        if last_fp and last_fp[0] == fingerprint and (datetime.now() - last_fp[1]).total_seconds() < 60:
-            st.error("This looks like a duplicate of the sale you just saved. Sale blocked.")
-            return
+    fp = (customer.strip().lower(), phone.strip(), pid, int(quantity), round(total, 2))
+    last_fp = st.session_state.get("last_fp")
+    if last_fp and last_fp[0] == fp and (datetime.now() - last_fp[1]).total_seconds() < 60:
+        st.error("This looks like a duplicate of the sale you just saved. Sale blocked.")
+        return
 
-        # re-read the product from the database for safe stock + price
-        try:
-            fresh = supabase.table("products").select("*").eq("id", pid).limit(1).execute().data
-        except Exception as e:
-            st.error(f"Could not verify stock: {e}")
-            return
+    with st.spinner("Saving sale..."):
+        fresh = supabase.table("products").select("*").eq("id", pid).limit(1).execute().data
         if not fresh:
             st.error("This product no longer exists.")
             return
@@ -706,402 +1018,529 @@ def billing_page():
             st.error(f"Not enough stock. Only {fresh_qty} unit(s) available.")
             return
 
-        # staff must use the database price, never a browser value
         unit_price = price if admin else num(fresh.get("selling_price"))
         sub = unit_price * int(quantity)
         disc = min(discount, sub)
         final_total = sub - disc
         paid_final = min(paid, final_total)
-        remaining = final_total - paid_final
-
         sale_date = today_pk()
         warranty_days = int(num(fresh.get("warranty_days")))
-        warranty_expiry = sale_date + timedelta(days=warranty_days)
+        expiry = sale_date + timedelta(days=warranty_days)
         invoice = "LHB-" + sale_date.strftime("%Y%m%d") + "-" + secrets.token_hex(4).upper()
 
-        stock_reserved = False
-        sale_id = None
-        item_saved = False
-        payment_saved = False
+        reserved, sale_id, item_saved, pay_saved = False, None, False, False
         try:
-            # 1) reserve stock (only succeeds if nobody changed it meanwhile)
-            upd = (
-                supabase.table("products")
-                .update({"quantity": fresh_qty - int(quantity)})
-                .eq("id", pid)
-                .eq("quantity", fresh_qty)
-                .execute()
-                .data
-            )
+            upd = supabase.table("products").update({"quantity": fresh_qty - int(quantity)}).eq("id", pid).eq("quantity", fresh_qty).execute().data
             if not upd:
                 st.error("Stock changed while saving. Please try again.")
                 return
-            stock_reserved = True
-
-            # 2) sale record
-            base_sale = {
-                "invoice_no": invoice,
-                "customer_name": customer.strip(),
-                "customer_phone": phone.strip(),
-                "sale_date": sale_date.isoformat(),
-                "sold_by": current_username(),
-                "total": final_total,
-                "paid_amount": paid_final,
-                "discount": disc,
-            }
-            full_sale = dict(base_sale)
-            full_sale.update({"notes": notes.strip(), "payment_method": method})
-            res, _ = insert_with_fallback("sales", full_sale, base_sale)
-            sale_id = res.data[0]["id"]
-
-            # 3) sale item
-            supabase.table("sale_items").insert(
-                {
-                    "sale_id": sale_id,
-                    "product_id": pid,
-                    "product_name": fresh.get("name"),
-                    "specs": spec_text(fresh),
-                    "quantity": int(quantity),
-                    "selling_price": unit_price,
-                    "purchase_price": num(fresh.get("purchase_price")),
-                    "warranty_days": warranty_days,
-                    "warranty_expiry": warranty_expiry.isoformat(),
-                }
-            ).execute()
+            reserved = True
+            base_sale = {"invoice_no": invoice, "customer_name": customer.strip(), "customer_phone": phone.strip(),
+                         "sale_date": sale_date.isoformat(), "sold_by": current_username(), "total": final_total,
+                         "paid_amount": paid_final, "discount": disc}
+            sale_data, _ = with_optional("sales", base_sale, {"notes": notes.strip(), "payment_method": method, "status": "active"})
+            sale_id = supabase.table("sales").insert(sale_data).execute().data[0]["id"]
+            supabase.table("sale_items").insert({
+                "sale_id": sale_id, "product_id": pid, "product_name": fresh.get("name"), "specs": spec_text(fresh),
+                "quantity": int(quantity), "selling_price": unit_price, "purchase_price": num(fresh.get("purchase_price")),
+                "warranty_days": warranty_days, "warranty_expiry": expiry.isoformat()}).execute()
             item_saved = True
-
-            # 4) payment
             if paid_final > 0:
-                note = f"Initial payment ({method})"
-                if notes.strip():
-                    note += f" - {notes.strip()}"
-                supabase.table("payments").insert(
-                    {
-                        "sale_id": sale_id,
-                        "amount": paid_final,
-                        "received_by": current_username(),
-                        "note": note,
-                    }
-                ).execute()
-                payment_saved = True
-
+                note = f"Initial payment ({method})" + (f" - {notes.strip()}" if notes.strip() else "")
+                supabase.table("payments").insert({"sale_id": sale_id, "amount": paid_final,
+                                                   "received_by": current_username(), "note": note}).execute()
+                pay_saved = True
         except Exception as e:
-            # roll back everything that was saved
             try:
-                if payment_saved and sale_id:
+                if pay_saved:
                     supabase.table("payments").delete().eq("sale_id", sale_id).execute()
-                if item_saved and sale_id:
+                if item_saved:
                     supabase.table("sale_items").delete().eq("sale_id", sale_id).execute()
                 if sale_id:
                     supabase.table("sales").delete().eq("id", sale_id).execute()
-                if stock_reserved:
+                if reserved:
                     supabase.table("products").update({"quantity": fresh_qty}).eq("id", pid).execute()
             except Exception:
                 pass
             st.error(f"Sale failed and was cancelled: {e}")
             return
 
-        st.session_state.last_fp = (fingerprint, datetime.now())
-        st.session_state.sale_nonce = nonce + 1
-        st.session_state.last_receipt = {
-            "invoice": invoice,
-            "date": sale_date.isoformat(),
-            "customer": customer.strip(),
-            "phone": phone.strip(),
-            "sold_by": current_username(),
-            "product": fresh.get("name"),
-            "specs": spec_text(fresh) or "-",
-            "qty": int(quantity),
-            "price": unit_price,
-            "subtotal": sub,
-            "discount": disc,
-            "total": final_total,
-            "paid": paid_final,
-            "method": method,
-            "balance": remaining,
-            "warranty_days": warranty_days,
-            "warranty_expiry": warranty_expiry.isoformat(),
-            "notes": notes.strip() or "-",
-        }
-        st.rerun()
+    st.session_state.last_fp = (fp, datetime.now())
+    st.session_state.sale_nonce = nonce + 1
+    st.session_state.last_receipt = {
+        "invoice": invoice, "date": sale_date.isoformat(), "customer": customer.strip(), "phone": phone.strip(),
+        "sold_by": current_username(), "product": fresh.get("name"), "specs": spec_text(fresh) or "-",
+        "qty": int(quantity), "price": unit_price, "subtotal": sub, "discount": disc, "total": final_total,
+        "paid": paid_final, "method": method, "balance": final_total - paid_final, "warranty_days": warranty_days,
+        "warranty_expiry": expiry.isoformat(), "notes": notes.strip() or "-"}
+    st.toast("Sale completed!", icon="✅")
+    st.rerun()
 
 
-# ------------------------------------------------------------------
+# ==================================================================
 # SALES HISTORY
-# ------------------------------------------------------------------
-def sales_history():
-    st.subheader("📚 Sales History")
-    admin = is_admin()
+# ==================================================================
+def build_history(sales, items, admin, has_status):
+    by_sale = {}
+    for it in items:
+        by_sale.setdefault(it.get("sale_id"), []).append(it)
+    rows = []
+    for s in sorted(sales, key=lambda x: x.get("id", 0), reverse=True):
+        cancelled = sale_status(s) == "cancelled"
+        total, paid, disc = num(s.get("total")), num(s.get("paid_amount")), num(s.get("discount"))
+        sitems = by_sale.get(s.get("id"), [])
+        subtotal = sum(num(i.get("selling_price")) * num(i.get("quantity")) for i in sitems)
+        base = {"Invoice No": s.get("invoice_no"), "Customer": s.get("customer_name"), "Phone": s.get("customer_phone"),
+                "Date": s.get("sale_date"), "Sold By": s.get("sold_by")}
+        if has_status:
+            base["Status"] = "Cancelled" if cancelled else "Active"
+        for i in (sitems or [{}]):
+            qty, sp = num(i.get("quantity")), num(i.get("selling_price"))
+            row = dict(base)
+            row.update({"Product": i.get("product_name", ""), "Specs": i.get("specs", ""), "Qty": int(qty),
+                        "Selling Price": sp, "Discount": disc, "Total": total, "Paid": paid,
+                        "Remaining": 0 if cancelled else max(total - paid, 0)})
+            if admin:
+                pp = num(i.get("purchase_price"))
+                share = (sp * qty / subtotal) if subtotal else 0
+                row["Purchase Price"] = pp
+                row["Profit"] = 0 if (cancelled or not i) else round(sp * qty - pp * qty - disc * share, 2)
+            rows.append(row)
+    return pd.DataFrame(rows)
 
-    sales = get_data("sales")
-    if not sales:
-        st.info("No sales available.")
-        return
 
-    items = load_sale_items()
-    df = build_history(sales, items, admin)
-
-    f1, f2 = st.columns([3, 1])
-    search = f1.text_input("🔍 Search invoice, customer or phone")
-    only_unpaid = f2.checkbox("Only unpaid balances")
-
-    view = df.copy()
-    if search.strip():
-        s = search.strip().lower()
-        mask = (
-            view["Invoice No"].astype(str).str.lower().str.contains(s, na=False)
-            | view["Customer"].astype(str).str.lower().str.contains(s, na=False)
-            | view["Phone"].astype(str).str.lower().str.contains(s, na=False)
-        )
-        view = view[mask]
-    if only_unpaid:
-        view = view[view["Remaining"] > 0]
-
-    show_table(view)
-
-    # ---------------- RECEIVE BALANCE ----------------
-    st.divider()
-    st.markdown("### 💵 Receive Balance Payment")
-    unpaid = [s for s in sales if num(s.get("total")) - num(s.get("paid_amount")) > 0.5]
+def receive_payment_tab(sales):
+    unpaid = sorted([s for s in active_sales(sales) if num(s.get("total")) - num(s.get("paid_amount")) > 0.5],
+                    key=lambda x: x.get("id", 0), reverse=True)
     if not unpaid:
-        st.success("All customers have paid in full.")
+        empty_state("🎉", "All paid", "All customers have paid in full.")
         return
-
-    unpaid = sorted(unpaid, key=lambda x: x.get("id", 0), reverse=True)
-    sale_ids = [s["id"] for s in unpaid]
-    labels = {
-        s["id"]: f'{s.get("invoice_no")} | {s.get("customer_name")} | '
-        f'Balance {pkr(num(s.get("total")) - num(s.get("paid_amount")))}'
-        for s in unpaid
-    }
-    sid = st.selectbox("Select invoice", sale_ids, format_func=lambda i: labels[i])
+    ids = [s["id"] for s in unpaid]
+    labels = {s["id"]: f'{s.get("invoice_no")} | {s.get("customer_name")} | Balance {pkr(num(s.get("total")) - num(s.get("paid_amount")))}' for s in unpaid}
+    sid = st.selectbox("Select invoice", ids, format_func=lambda i: labels[i], key="rcv_sid")
     sale = next(s for s in unpaid if s["id"] == sid)
     balance = num(sale.get("total")) - num(sale.get("paid_amount"))
-
     r1, r2 = st.columns(2)
-    amount = r1.number_input(
-        "Amount received (Rs)", min_value=0.0, max_value=float(balance),
-        value=float(balance), step=500.0, key=f"rcv_{sid}",
-    )
+    amount = r1.number_input("Amount received (Rs)", min_value=0.0, max_value=float(balance), value=float(balance),
+                             step=500.0, key=f"rcv_{sid}")
     method = r2.selectbox("Payment Method", PAYMENT_METHODS, key=f"rcv_m_{sid}")
-    confirm = st.checkbox("Confirm this payment was received", key=f"rcv_c_{sid}")
-
-    if st.button("Save Payment", disabled=not confirm):
+    ok = st.checkbox("Confirm this payment was received", key=f"rcv_c_{sid}")
+    if st.button("💵 Save Payment", disabled=not ok):
         if amount <= 0:
             st.error("Enter an amount greater than zero.")
             return
         try:
+            require_login()
             latest = supabase.table("sales").select("*").eq("id", sid).limit(1).execute().data[0]
+            if sale_status(latest) == "cancelled":
+                st.error("This sale is cancelled.")
+                return
             new_paid = num(latest.get("paid_amount")) + amount
             if new_paid > num(latest.get("total")) + 0.5:
                 st.error("Payment is more than the remaining balance.")
                 return
             supabase.table("sales").update({"paid_amount": new_paid}).eq("id", sid).execute()
-            supabase.table("payments").insert(
-                {
-                    "sale_id": sid,
-                    "amount": amount,
-                    "received_by": current_username(),
-                    "note": f"Balance payment ({method})",
-                }
-            ).execute()
-            st.session_state.flash = ("success", "Payment saved.")
+            supabase.table("payments").insert({"sale_id": sid, "amount": amount, "received_by": current_username(),
+                                               "note": f"Balance payment ({method})"}).execute()
+            flash("success", "Payment saved.")
             st.rerun()
         except Exception as e:
             st.error(f"Payment failed: {e}")
 
 
-# ------------------------------------------------------------------
-# ADMIN REPORTS
-# ------------------------------------------------------------------
+def manage_sales_tab(sales, items):
+    if not sales:
+        empty_state("🧾", "No sales", "Nothing to manage yet.")
+        return
+    sales = sorted(sales, key=lambda x: x.get("id", 0), reverse=True)
+    ids = [s["id"] for s in sales]
+    labels = {s["id"]: f'{s.get("invoice_no")} | {s.get("customer_name")} | {pkr(s.get("total"))}'
+                       f'{" | CANCELLED" if sale_status(s) == "cancelled" else ""}' for s in sales}
+    sid = st.selectbox("Select invoice", ids, format_func=lambda i: labels[i], key="mng_sid")
+    sale = next(s for s in sales if s["id"] == sid)
+    sitems = [i for i in items if i.get("sale_id") == sid]
+    cancelled = sale_status(sale) == "cancelled"
+    if cancelled:
+        st.info("This sale is cancelled. Stock was returned. It cannot be edited.")
+
+    st.markdown("### ✏️ Edit Sale")
+    with st.form(f"edit_sale_{sid}"):
+        e1, e2 = st.columns(2)
+        cust = e1.text_input("Customer Name", value=sale.get("customer_name") or "", key=f"es_c_{sid}")
+        ph = e2.text_input("Customer Phone", value=sale.get("customer_phone") or "", key=f"es_p_{sid}")
+        if len(sitems) == 1:
+            it = sitems[0]
+            e3, e4, e5 = st.columns(3)
+            q = e3.number_input("Quantity", min_value=1, value=max(int(num(it.get("quantity"))), 1), step=1, key=f"es_q_{sid}")
+            pr = e4.number_input("Selling Price (Rs)", min_value=0.0, value=num(it.get("selling_price")), step=500.0, key=f"es_pr_{sid}")
+            di = e5.number_input("Discount (Rs)", min_value=0.0, value=num(sale.get("discount")), step=100.0, key=f"es_d_{sid}")
+        else:
+            st.caption("This invoice has no single item, so only customer details can be edited.")
+            q, pr, di = 1, 0.0, 0.0
+        nt = st.text_area("Notes", value=sale.get("notes") or "", key=f"es_n_{sid}") if col_exists("sales", "notes") else ""
+        st.caption(f"Already paid: {pkr(sale.get('paid_amount'))}. Payments are changed only in 'Receive Payment'. "
+                   "Changing quantity automatically adjusts stock.")
+        go = st.form_submit_button("💾 Save Sale Changes", type="primary", disabled=cancelled)
+    if go:
+        if not cust.strip() or not ph.strip():
+            st.error("Customer name and phone are required.")
+        else:
+            try:
+                update_sale(sid, cust, ph, int(q), float(pr), float(di), nt)
+                flash("success", "Sale updated and stock adjusted.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Edit failed: {e}")
+
+    st.markdown("### 🚫 Cancel Sale")
+    if not col_exists("sales", "status"):
+        st.warning("Cancelling needs the 'status' column. Run the SQL migration, then press 'Re-check database' in Admin Settings.")
+    elif not cancelled:
+        st.write("Cancelling returns the sold units to stock and keeps the invoice and payment history for your records. "
+                 "The invoice is excluded from sales totals.")
+        reason = st.text_input("Reason for cancelling", key=f"cx_r_{sid}")
+        ok = st.checkbox("Yes, cancel this sale and return the stock", key=f"cx_c_{sid}")
+        if st.button("Cancel This Sale", disabled=not (ok and reason.strip()), key=f"cx_b_{sid}"):
+            try:
+                missing = cancel_sale(sid, reason)
+                flash("success", "Sale cancelled and stock restored." + (
+                    f" Warning: {missing} item(s) could not be returned to stock (product deleted)." if missing else ""))
+                st.rerun()
+            except Exception as e:
+                st.error(f"Cancel failed: {e}")
+
+    with st.expander("🗑️ Permanently delete this invoice"):
+        st.warning("Permanent. Items and payments of this invoice are deleted and stock is returned (if not already cancelled). "
+                   "Download the backup first. Cancelling is usually the better choice.")
+        pays = supabase.table("payments").select("*").eq("sale_id", sid).execute().data or []
+        st.download_button("⬇️ Backup this invoice (ZIP)", zip_bytes({"sale": [sale], "sale_items": sitems, "payments": pays}),
+                           file_name=f"backup_{sale.get('invoice_no')}.zip", mime="application/zip", key=f"dbk_{sid}")
+        typed = st.text_input(f"Type the invoice number ({sale.get('invoice_no')}) to confirm", key=f"dl_t_{sid}")
+        if st.button("Delete Invoice Permanently", disabled=typed.strip() != str(sale.get("invoice_no")), key=f"dl_b_{sid}"):
+            try:
+                missing = delete_sale_full(sid)
+                flash("success", "Invoice deleted." + (f" Warning: {missing} item(s) not returned to stock." if missing else ""))
+                st.rerun()
+            except Exception as e:
+                st.error(f"Delete failed: {e}")
+
+
+def sales_history():
+    page_header("📚", "Sales History", "Invoices, payments and balances")
+    admin = is_admin()
+    sales = get_data("sales")
+    items = load_sale_items() if not admin else get_data("sale_items")
+    has_status = col_exists("sales", "status")
+
+    tabs = ["📋 History", "💵 Receive Payment"] + (["🛠️ Edit / Cancel / Delete"] if admin else [])
+    t = st.tabs(tabs)
+    with t[0]:
+        if not sales:
+            empty_state("🧾", "No sales yet", "Completed sales will appear here.")
+        else:
+            df = build_history(sales, items, admin, has_status)
+            f1, f2, f3 = st.columns([3, 1, 1])
+            search = f1.text_input("🔍 Search invoice, customer or phone", key="flt_hist_search")
+            unpaid = f2.checkbox("Only unpaid", key="flt_hist_unpaid")
+            hide_c = f3.checkbox("Hide cancelled", value=True, key="flt_hist_cancel") if has_status else False
+            view = df
+            if search.strip():
+                s = search.strip().lower()
+                view = view[view["Invoice No"].astype(str).str.lower().str.contains(s, na=False)
+                            | view["Customer"].astype(str).str.lower().str.contains(s, na=False)
+                            | view["Phone"].astype(str).str.lower().str.contains(s, na=False)]
+            if unpaid:
+                view = view[view["Remaining"] > 0]
+            if hide_c:
+                view = view[view["Status"] != "Cancelled"]
+            if view.empty:
+                empty_state("🔍", "No matching invoices", "Try a different search or filter.")
+            else:
+                show_table(view)
+    with t[1]:
+        receive_payment_tab(sales)
+    if admin:
+        with t[2]:
+            manage_sales_tab(sales, items)
+
+
+# ==================================================================
+# REPORTS & PDF (ADMIN ONLY)
+# ==================================================================
 def reports():
+    page_header("📊", "Reports & PDFs", "Business performance and downloadable reports")
     if not is_admin():
         st.error("Access denied. Reports are for the Owner/Admin only.")
         return
+    products, all_sales, items = get_data("products"), get_data("sales"), get_data("sale_items")
+    sales = active_sales(all_sales)
+    t1, t2 = st.tabs(["📈 Summary", "📄 PDF Reports"])
 
-    st.subheader("📊 Admin Reports")
-
-    products = get_data("products")
-    sales = get_data("sales")
-    items = get_data("sale_items")
-
-    total_stock = sum(int(num(p.get("quantity"))) for p in products)
-    total_sales = sum(num(s.get("total")) for s in sales)
-    received = sum(num(s.get("paid_amount")) for s in sales)
-    remaining = sum(max(num(s.get("total")) - num(s.get("paid_amount")), 0) for s in sales)
-    cost = sum(num(i.get("purchase_price")) * num(i.get("quantity")) for i in items)
-    sale_ids_with_items = {i.get("sale_id") for i in items}
-    revenue_with_items = sum(num(s.get("total")) for s in sales if s.get("id") in sale_ids_with_items)
-    gross_profit = revenue_with_items - cost
-
-    a, b, c, d = st.columns(4)
-    a.metric("Total Products", len(products))
-    b.metric("Total Stock Units", total_stock)
-    c.metric("Total Invoices", len(sales))
-    d.metric("Total Sales", pkr(total_sales))
-
-    e, f, g = st.columns(3)
-    e.metric("Total Received Payments", pkr(received))
-    f.metric("Remaining Customer Balances", pkr(remaining))
-    g.metric("Estimated Gross Profit", pkr(gross_profit))
-
-    st.markdown("### 👥 Staff Sales Performance")
-    if sales:
-        profit_by_sale = {}
-        cost_by_sale = {}
-        for i in items:
-            cost_by_sale[i.get("sale_id")] = cost_by_sale.get(i.get("sale_id"), 0) + num(
-                i.get("purchase_price")
-            ) * num(i.get("quantity"))
-
+    with t1:
+        total = sum(num(s.get("total")) for s in sales)
+        received = sum(num(s.get("paid_amount")) for s in sales)
+        remaining = sum(max(num(s.get("total")) - num(s.get("paid_amount")), 0) for s in sales)
+        profit = sum(profit_map(sales, items).values())
+        cards([("📦", "Total Products", len(products), "#1f6feb"),
+               ("🧮", "Total Stock Units", sum(int(num(p.get("quantity"))) for p in products), "#7c3aed"),
+               ("🧾", "Total Invoices", len(sales), "#0ea5e9"), ("💰", "Total Sales", pkr(total), "#12b76a"),
+               ("💵", "Received Payments", pkr(received), "#16a34a"), ("⏳", "Remaining Balances", pkr(remaining), "#f79009"),
+               ("📈", "Estimated Gross Profit", pkr(profit), "#db2777")])
+        st.markdown("### 👥 Staff Sales Performance")
+        pm = profit_map(sales, items)
         perf = {}
         for s in sales:
-            who = s.get("sold_by") or "Unknown"
-            row = perf.setdefault(who, {"Invoices": 0, "Sales": 0.0, "Received": 0.0, "Profit": 0.0})
-            row["Invoices"] += 1
-            row["Sales"] += num(s.get("total"))
-            row["Received"] += num(s.get("paid_amount"))
-            if s.get("id") in cost_by_sale:
-                row["Profit"] += num(s.get("total")) - cost_by_sale[s.get("id")]
+            r = perf.setdefault(s.get("sold_by") or "Unknown", {"Invoices": 0, "Sales": 0.0, "Received": 0.0, "Profit": 0.0})
+            r["Invoices"] += 1
+            r["Sales"] += num(s.get("total"))
+            r["Received"] += num(s.get("paid_amount"))
+            r["Profit"] += pm.get(s["id"], 0)
+        if perf:
+            show_table(pd.DataFrame([{"Staff": k, "Invoices": v["Invoices"], "Total Sales": pkr(v["Sales"]),
+                                      "Received": pkr(v["Received"]), "Estimated Profit": pkr(v["Profit"])}
+                                     for k, v in sorted(perf.items(), key=lambda kv: -kv[1]["Sales"])]))
+        else:
+            empty_state("👥", "No sales yet", "Staff performance will appear after the first sale.")
+        st.markdown("### 💰 Customers With Remaining Balance")
+        owing = [s for s in sales if num(s.get("total")) - num(s.get("paid_amount")) > 0.5]
+        if owing:
+            show_table(pd.DataFrame([{"Invoice": s.get("invoice_no"), "Customer": s.get("customer_name"),
+                                      "Phone": s.get("customer_phone"), "Total": pkr(s.get("total")),
+                                      "Paid": pkr(s.get("paid_amount")),
+                                      "Remaining": pkr(num(s.get("total")) - num(s.get("paid_amount")))} for s in owing]))
+        else:
+            empty_state("🎉", "No pending balances", "Every customer has paid in full.")
 
-        perf_df = pd.DataFrame(
-            [
-                {
-                    "Staff": k,
-                    "Invoices": v["Invoices"],
-                    "Total Sales": pkr(v["Sales"]),
-                    "Received": pkr(v["Received"]),
-                    "Estimated Profit": pkr(v["Profit"]),
-                }
-                for k, v in sorted(perf.items(), key=lambda kv: kv[1]["Sales"], reverse=True)
-            ]
-        )
-        show_table(perf_df)
-    else:
-        st.info("No sales yet.")
+    with t2:
+        def make(key, fn, *args):
+            try:
+                with st.spinner("Creating PDF..."):
+                    st.session_state[key] = fn(*args)
+                st.toast("PDF is ready", icon="📄")
+            except Exception as e:
+                st.session_state.pop(key, None)
+                st.error(f"Could not create PDF: {e}")
 
-    st.markdown("### 💰 Customers With Remaining Balance")
-    owing = [s for s in sales if num(s.get("total")) - num(s.get("paid_amount")) > 0.5]
-    if owing:
-        show_table(
-            pd.DataFrame(
-                [
-                    {
-                        "Invoice": s.get("invoice_no"),
-                        "Customer": s.get("customer_name"),
-                        "Phone": s.get("customer_phone"),
-                        "Total": pkr(s.get("total")),
-                        "Paid": pkr(s.get("paid_amount")),
-                        "Remaining": pkr(num(s.get("total")) - num(s.get("paid_amount"))),
-                    }
-                    for s in owing
-                ]
-            )
-        )
-    else:
-        st.success("No pending balances.")
+        st.markdown("### 📦 Inventory PDF")
+        st.caption("Contains purchase prices and inventory values (Admin only).")
+        if st.button("Generate Inventory PDF"):
+            make("pdf_inv", inventory_pdf, products)
+        if st.session_state.get("pdf_inv"):
+            st.download_button("⬇️ Download Inventory PDF", st.session_state["pdf_inv"],
+                               file_name=f"inventory_{today_pk().isoformat()}.pdf", mime="application/pdf")
+        st.divider()
+        st.markdown("### 🧾 Sales PDFs")
+        rng = st.date_input("Select date range", value=(today_pk() - timedelta(days=29), today_pk()), key="flt_pdf_range")
+        if isinstance(rng, (tuple, list)) and len(rng) == 2:
+            d1, d2 = rng
+            in_sales = [s for s in all_sales if in_range(s, d1, d2)]
+            ids = {s["id"] for s in in_sales}
+            in_items = [i for i in items if i.get("sale_id") in ids]
+            a, b = st.columns(2)
+            with a:
+                if st.button("Generate Sold Products PDF"):
+                    make("pdf_sales", sales_pdf, in_sales, in_items, d1, d2)
+                if st.session_state.get("pdf_sales"):
+                    st.download_button("⬇️ Download Sold Products PDF", st.session_state["pdf_sales"],
+                                       file_name=f"sold_products_{d1}_{d2}.pdf", mime="application/pdf")
+            with b:
+                if st.button("Generate Sales Summary PDF"):
+                    make("pdf_sum", summary_pdf, in_sales, in_items, d1, d2)
+                if st.session_state.get("pdf_sum"):
+                    st.download_button("⬇️ Download Sales Summary PDF", st.session_state["pdf_sum"],
+                                       file_name=f"sales_summary_{d1}_{d2}.pdf", mime="application/pdf")
+            st.caption("Press 'Generate' again after changing the date range to refresh the PDF.")
+        else:
+            st.info("Please select both a start date and an end date.")
 
 
-# ------------------------------------------------------------------
+# ==================================================================
 # STAFF MANAGEMENT (ADMIN ONLY)
-# ------------------------------------------------------------------
+# ==================================================================
 def staff_management():
+    page_header("👥", "Staff Management", "Create and view staff accounts")
     if not is_admin():
         st.error("Access denied. Staff Management is for the Owner/Admin only.")
         return
-
-    st.subheader("👥 Staff Management")
-
     users = get_data("users")
     if users:
         rows = []
         for u in users:
             row = {"Username": u.get("username"), "Role": u.get("role")}
             if u.get("created_at"):
-                row["Created"] = str(u.get("created_at"))[:10]
+                row["Created"] = str(u["created_at"])[:10]
             rows.append(row)
         show_table(pd.DataFrame(rows))
     else:
-        st.info("No users found.")
-
+        empty_state("👥", "No users", "Create the first staff account below.")
     st.divider()
     with st.form("create_staff", clear_on_submit=True):
         st.markdown("### ➕ Create Staff Account")
         username = st.text_input("Username")
-        password = st.text_input("Password (minimum 6 characters)", type="password")
-        password2 = st.text_input("Confirm Password", type="password")
-        submit = st.form_submit_button("Create Staff Account")
-
+        pw = st.text_input("Password (minimum 6 characters)", type="password")
+        pw2 = st.text_input("Confirm Password", type="password")
+        submit = st.form_submit_button("Create Staff Account", type="primary")
     if submit:
         uname = username.strip()
         if not uname:
             st.error("Username is required.")
-        elif len(password) < 6:
+        elif len(pw) < 6:
             st.error("Password must be at least 6 characters.")
-        elif password != password2:
+        elif pw != pw2:
             st.error("Passwords do not match.")
         elif any(str(u.get("username", "")).lower() == uname.lower() for u in users):
             st.error("This username already exists.")
         else:
             try:
-                supabase.table("users").insert(
-                    {
-                        "username": uname,
-                        "password_hash": password_hash(password),
-                        "role": "staff",
-                    }
-                ).execute()
-                st.session_state.flash = ("success", f"Staff account '{uname}' created.")
+                require_admin()
+                supabase.table("users").insert({"username": uname, "password_hash": password_hash(pw), "role": "staff"}).execute()
+                flash("success", f"Staff account '{uname}' created.")
                 st.rerun()
             except Exception as e:
                 st.error(f"Could not create account: {e}")
 
 
-# ------------------------------------------------------------------
+# ==================================================================
+# ADMIN SETTINGS (BACKUP + RESET) — ADMIN ONLY
+# ==================================================================
+def admin_settings():
+    page_header("⚙️", "Admin Settings", "Backup, reset and maintenance tools")
+    if not is_admin():
+        st.error("Access denied. Admin settings are for the Owner/Admin only.")
+        return
+    t1, t2, t3, t4 = st.tabs(["💾 Backup / Export", "🧹 Reset Products", "🗂️ Reset Sales / Payments", "🔄 Reset Filters"])
+
+    with t1:
+        st.write("Download a backup of your data as a ZIP of CSV files. Password hashes are never included.")
+        if st.button("Prepare Full Backup"):
+            with st.spinner("Preparing backup..."):
+                tables = {t: get_data(t) for t in ("products", "sales", "sale_items", "payments", "users")}
+                for r in tables["users"]:
+                    r.pop("password_hash", None)
+                st.session_state["backup_zip"] = zip_bytes(tables)
+        if st.session_state.get("backup_zip"):
+            st.download_button("⬇️ Download Backup ZIP", st.session_state["backup_zip"],
+                               file_name=f"laptop_house_backup_{today_pk().isoformat()}.zip", mime="application/zip")
+        if st.button("Re-check database columns"):
+            st.session_state.pop("_cols", None)
+            st.success("Done. The app will re-check optional columns.")
+
+    with t2:
+        st.markdown("#### Reset selected product information")
+        products = get_data("products")
+        if not products:
+            empty_state("📦", "No products", "Nothing to reset.")
+        else:
+            labels = {p["id"]: f'#{p["id"]} {p.get("name")} {p.get("model") or ""}' for p in products}
+            sel = st.multiselect("Step 1 — Choose products (maximum 20)", list(labels), format_func=lambda i: labels[i], key="rp_sel")
+            opts = ["Stock quantity → 0", "Purchase and selling price → 0", "Serial number → blank",
+                    "Warranty days → 0", "Warranty terms → blank"]
+            fields = st.multiselect("Step 2 — Choose what to reset", opts, key="rp_fields")
+            if sel and fields:
+                st.warning(f"**What will happen:** for {len(sel)} selected product(s): {', '.join(fields)}. "
+                           "The products themselves and all sales records are NOT deleted.")
+                chosen = [p for p in products if p["id"] in sel]
+                st.download_button("Step 3 — ⬇️ Download backup of these products", pd.DataFrame(chosen).to_csv(index=False),
+                                   file_name="products_backup_before_reset.csv", mime="text/csv")
+                b1 = st.checkbox("I downloaded the backup", key="rp_b1")
+                typed = st.text_input("Step 4 — Type RESET PRODUCTS to confirm", key="rp_typed")
+                b2 = st.checkbox("Second confirmation: I understand this changes my product data", key="rp_b2")
+                ready = b1 and b2 and typed.strip() == "RESET PRODUCTS" and len(sel) <= 20
+                if len(sel) > 20:
+                    st.error("Please select at most 20 products at a time.")
+                if st.button("Reset Selected Products", disabled=not ready, type="primary"):
+                    try:
+                        reset_products(sel, fields)
+                        flash("success", f"{len(sel)} product(s) reset.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Reset failed: {e}")
+
+    with t3:
+        st.markdown("#### Reset selected sales / payment records")
+        sales = sorted(get_data("sales"), key=lambda x: x.get("id", 0), reverse=True)
+        if not sales:
+            empty_state("🧾", "No sales", "Nothing to reset.")
+        else:
+            labels = {s["id"]: f'{s.get("invoice_no")} | {s.get("customer_name")} | {pkr(s.get("total"))}' for s in sales}
+            sel = st.multiselect("Step 1 — Choose invoices (maximum 10)", list(labels), format_func=lambda i: labels[i], key="rs_sel")
+            action = st.radio("Step 2 — Choose action", [
+                "Reset payments only (payment records deleted, paid amount set to 0)",
+                "Delete invoices completely (stock returned, items and payments deleted)"], key="rs_action")
+            if sel:
+                full = action.startswith("Delete")
+                st.warning(f"**What will happen:** {len(sel)} invoice(s) selected. " + (
+                    "Each invoice, its items and its payments will be permanently deleted and sold units go back to stock."
+                    if full else "All payment records of these invoices will be deleted and their paid amount becomes Rs 0."))
+                ids = set(sel)
+                st.download_button("Step 3 — ⬇️ Download backup of these invoices (ZIP)", zip_bytes({
+                    "sales": [s for s in sales if s["id"] in ids],
+                    "sale_items": [i for i in get_data("sale_items") if i.get("sale_id") in ids],
+                    "payments": [p for p in get_data("payments") if p.get("sale_id") in ids]}),
+                    file_name="sales_backup_before_reset.zip", mime="application/zip")
+                b1 = st.checkbox("I downloaded the backup", key="rs_b1")
+                typed = st.text_input("Step 4 — Type DELETE SALES to confirm", key="rs_typed")
+                b2 = st.checkbox("Second confirmation: I understand this cannot be undone", key="rs_b2")
+                ready = b1 and b2 and typed.strip() == "DELETE SALES" and len(sel) <= 10
+                if len(sel) > 10:
+                    st.error("Please select at most 10 invoices at a time.")
+                if st.button("Apply Reset to Selected Invoices", disabled=not ready, type="primary"):
+                    try:
+                        warn = 0
+                        for sid in sel:
+                            if full:
+                                warn += delete_sale_full(sid)
+                            else:
+                                reset_sale_payments(sid)
+                        flash("success", f"Done for {len(sel)} invoice(s)." + (f" {warn} item(s) could not be returned to stock." if warn else ""))
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Reset failed: {e}")
+
+    with t4:
+        st.markdown("#### Reset application filters and dashboard settings")
+        st.write("This only clears search boxes, filters, the dashboard period and the low-stock limit. **No database data is changed.**")
+        if st.button("Reset Filters & Dashboard Settings"):
+            for k in list(st.session_state.keys()):
+                if str(k).startswith(("flt_", "set_")):
+                    del st.session_state[k]
+            flash("success", "Filters and dashboard settings were reset.")
+            st.rerun()
+
+
+# ==================================================================
 # MAIN
-# ------------------------------------------------------------------
+# ==================================================================
 def main():
     if "user" not in st.session_state:
         login()
         return
 
     admin = is_admin()
-
-    st.sidebar.markdown("## 💻 Laptop House Buner")
-    st.sidebar.write(f'👤 **{current_username()}**')
-    st.sidebar.caption("Role: " + ("Owner / Admin" if admin else "Staff"))
+    st.sidebar.markdown('<div class="side-brand">💻 Laptop House Buner</div>', unsafe_allow_html=True)
+    st.sidebar.markdown(
+        f'<div class="side-user">👤 <b>{current_username()}</b><br>'
+        f'<small>{"Owner / Admin" if admin else "Staff"}</small></div>', unsafe_allow_html=True)
     st.sidebar.divider()
 
-    menu = ["Dashboard", "Products & Stock", "New Sale / Billing", "Sales History"]
+    pages = {"🏠 Dashboard": dashboard, "📦 Products & Stock": products_page,
+             "🧾 New Sale / Billing": billing_page, "📚 Sales History": sales_history}
     if admin:
-        menu += ["Reports", "Staff Management"]
-
-    page = st.sidebar.radio("Menu", menu)
-
+        pages.update({"📊 Reports & PDFs": reports, "👥 Staff Management": staff_management,
+                      "⚙️ Admin Settings": admin_settings})
+    choice = st.sidebar.radio("Navigation", list(pages), label_visibility="collapsed")
     st.sidebar.divider()
-    if st.sidebar.button("Logout"):
-        for key in list(st.session_state.keys()):
-            del st.session_state[key]
+    if st.sidebar.button("🚪 Logout"):
+        st.session_state.clear()
         st.rerun()
 
-    # one-time messages after saving
-    flash = st.session_state.pop("flash", None)
-    if flash:
-        kind, text = flash
+    flash_msg = st.session_state.pop("flash", None)
+    if flash_msg:
+        kind, text = flash_msg
         (st.success if kind == "success" else st.error)(text)
+        st.toast(text, icon="✅" if kind == "success" else "⚠️")
 
-    if page == "Dashboard":
-        dashboard()
-    elif page == "Products & Stock":
-        products_page()
-    elif page == "New Sale / Billing":
-        billing_page()
-    elif page == "Sales History":
-        sales_history()
-    elif page == "Reports":
-        reports()
-    elif page == "Staff Management":
-        staff_management()
+    pages[choice]()
 
 
 main()
