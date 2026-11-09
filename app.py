@@ -229,11 +229,18 @@ def with_optional(table, base, extras):
 
 def get_data(table):
     rows, start = [], 0
+    ordered = True
     while True:
-        chunk = (
-            supabase.table(table).select("*").order("id").range(start, start + 999).execute().data
-            or []
-        )
+        try:
+            q = supabase.table(table).select("*")
+            if ordered:
+                q = q.order("id")
+            chunk = q.range(start, start + 999).execute().data or []
+        except Exception:
+            if ordered and start == 0:
+                ordered = False  # table without an "id" column: read without ordering
+                continue
+            raise
         rows.extend(chunk)
         if len(chunk) < 1000:
             break
@@ -1401,26 +1408,421 @@ def staff_management():
 
 
 # ==================================================================
-# ADMIN SETTINGS (BACKUP + RESET) — ADMIN ONLY
+# BACKUP & EXPORT CENTER (ADMIN ONLY)
+# ==================================================================
+BACKUP_TABLES = [("Products", "products"), ("Sales", "sales"), ("Sale Items", "sale_items"),
+                 ("Payments", "payments"), ("Staff Accounts", "users")]
+DEFAULT_COLUMNS = {
+    "products": ["id", "name", "category", "model", "processor", "ram", "storage", "condition_text",
+                 "serial_number", "purchase_price", "selling_price", "quantity", "warranty_days"],
+    "sales": ["id", "invoice_no", "customer_name", "customer_phone", "sale_date", "sold_by", "total",
+              "paid_amount", "discount"],
+    "sale_items": ["id", "sale_id", "product_id", "product_name", "specs", "quantity", "selling_price",
+                   "purchase_price", "warranty_days", "warranty_expiry"],
+    "payments": ["id", "sale_id", "amount", "received_by", "note"],
+    "users": ["id", "username", "role", "created_at"],
+}
+SAFE_USER_FIELDS = ("id", "username", "role", "created_at")  # whitelist: hashes are never exported
+PDF_ROW_CAP = 5000
+EXCEL_STYLE_CAP = 20000
+MONEY_WORDS = ("price", "total", "amount", "paid", "discount")
+
+
+def backup_now():
+    return datetime.now(timezone(timedelta(hours=5)))
+
+
+def safe_users(rows):
+    return [{k: r.get(k) for k in SAFE_USER_FIELDS if k in r} for r in rows]
+
+
+def collect_backup_data():
+    require_admin()
+    tables = {n: get_data(n) for n in ("products", "sales", "sale_items", "payments")}
+    tables["users"] = safe_users(get_data("users"))
+    return tables
+
+
+def table_columns(key, rows):
+    cols = []
+    for r in rows:
+        for k in r:
+            if k not in cols:
+                cols.append(k)
+    return cols or DEFAULT_COLUMNS[key]
+
+
+def cap_rows(rows):
+    if len(rows) > PDF_ROW_CAP:
+        return rows[:PDF_ROW_CAP], (f"Showing the first {PDF_ROW_CAP:,} of {len(rows):,} records in this section. "
+                                    "The Excel backup contains every record.")
+    return rows, None
+
+
+def excel_backup(tables, now, who):
+    require_admin()
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        raise RuntimeError("Excel library missing. Add 'openpyxl' to requirements.txt and reboot the app.")
+    stamp = now.strftime("%d %b %Y, %I:%M %p")
+    navy = PatternFill("solid", fgColor="0B1F3A")
+    band = PatternFill("solid", fgColor="F3F6FB")
+    thin = Side(style="thin", color="CBD5E1")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Backup Info"
+    ws["A1"] = "LAPTOP HOUSE BUNER — Excel Backup"
+    ws["A1"].font = Font(bold=True, size=16, color="0B1F3A")
+    info = [("Backup date & time", stamp), ("Created by", who), ("Scope", "All records (no date filter)"),
+            ("Security", "Staff passwords and password hashes are NOT included.")]
+    for r, (k, v) in enumerate(info, 3):
+        ws.cell(row=r, column=1, value=k).font = Font(bold=True)
+        ws.cell(row=r, column=2, value=v)
+    r = 3 + len(info) + 1
+    for j, h in enumerate(("Worksheet", "Records"), 1):
+        c = ws.cell(row=r, column=j, value=h)
+        c.font = Font(bold=True, color="FFFFFF")
+        c.fill = navy
+    for title, key in BACKUP_TABLES:
+        r += 1
+        ws.cell(row=r, column=1, value=title)
+        ws.cell(row=r, column=2, value=len(tables[key]))
+    ws.column_dimensions["A"].width = 26
+    ws.column_dimensions["B"].width = 58
+    ws.sheet_properties.tabColor = "0B1F3A"
+
+    for title, key in BACKUP_TABLES:
+        rows = tables[key]
+        cols = table_columns(key, rows)
+        ws = wb.create_sheet(title)
+        ws["A1"] = f"Laptop House Buner — {title}"
+        ws["A1"].font = Font(bold=True, size=14, color="0B1F3A")
+        ws["A2"] = f"Backup date & time: {stamp}   |   Records: {len(rows)}"
+        ws["A2"].font = Font(italic=True, color="64748B")
+        for j, c in enumerate(cols, 1):
+            cell = ws.cell(row=3, column=j, value=c.replace("_", " ").title())
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = navy
+            cell.border = border
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        ws.row_dimensions[3].height = 24
+        widths = [len(c) + 4 for c in cols]
+        money = [any(w in c.lower() for w in MONEY_WORDS) for c in cols]
+        fancy = len(rows) <= EXCEL_STYLE_CAP
+        for i, row in enumerate(rows, 4):
+            for j, c in enumerate(cols, 1):
+                v = row.get(c)
+                if isinstance(v, (dict, list)):
+                    v = str(v)
+                cell = ws.cell(row=i, column=j, value=v)
+                if isinstance(v, str):
+                    if v.startswith("="):
+                        cell.data_type = "s"  # keep text as text (no formulas from data)
+                    widths[j - 1] = max(widths[j - 1], min(len(v) + 2, 60))
+                elif isinstance(v, (int, float)) and not isinstance(v, bool):
+                    if money[j - 1]:
+                        cell.number_format = "#,##0.00"
+                    widths[j - 1] = max(widths[j - 1], len(f"{v:,.2f}") + 2)
+                if fancy:
+                    cell.border = border
+                    if i % 2 == 1:
+                        cell.fill = band
+        for j, w in enumerate(widths, 1):
+            ws.column_dimensions[get_column_letter(j)].width = max(10, min(w, 60))
+        ws.freeze_panes = "A4"
+        ws.auto_filter.ref = f"A3:{get_column_letter(len(cols))}{max(len(rows) + 3, 3)}"
+        ws.print_title_rows = "3:3"
+        ws.page_setup.orientation = "landscape"
+        ws.sheet_properties.tabColor = "1F6FEB"
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def verify_excel(data, tables):
+    from openpyxl import load_workbook
+    wb = load_workbook(io.BytesIO(data))
+    return [(title, len(tables[key]), wb[title].max_row - 3) for title, key in BACKUP_TABLES]
+
+
+def backup_pdf(tables, d1, d2, who):
+    require_admin()
+    stamp = backup_now().strftime("%d %b %Y, %I:%M %p")
+    products = sorted(tables["products"], key=lambda p: str(p.get("name") or "").lower())
+    sales = sorted([s for s in tables["sales"] if in_range(s, d1, d2)], key=lambda x: x.get("id", 0))
+    by_id = {s["id"]: s for s in sales}
+    items = [i for i in tables["sale_items"] if i.get("sale_id") in by_id]
+    pays = [p for p in tables["payments"] if p.get("sale_id") in by_id]
+    act = active_sales(sales)
+    pm = profit_map(act, items)
+    total = sum(num(s.get("total")) for s in act)
+    paid = sum(num(s.get("paid_amount")) for s in act)
+    disc = sum(num(s.get("discount")) for s in act)
+    owing = [s for s in act if num(s.get("total")) - num(s.get("paid_amount")) > 0.5]
+    units = sum(int(num(p.get("quantity"))) for p in products)
+    buy_val = sum(num(p.get("purchase_price")) * num(p.get("quantity")) for p in products)
+    sell_val = sum(num(p.get("selling_price")) * num(p.get("quantity")) for p in products)
+    rng = f"{d1.strftime('%d %b %Y')} to {d2.strftime('%d %b %Y')}"
+    blocks = [
+        ("h", "Report Information"),
+        ("kpi", [("Report generated", stamp), ("Generated by", who), ("Sales date range", rng),
+                 ("Products in inventory", str(len(products))), ("Invoices in range", str(len(sales))),
+                 ("Payment records in range", str(len(pays)))]),
+        ("h", "Sales Summary and Totals"),
+        ("kpi", [("Total invoices (excluding cancelled)", str(len(act))),
+                 ("Cancelled invoices", str(len(sales) - len(act))), ("Total sales", pkr(total)),
+                 ("Total discounts given", pkr(disc)), ("Total received payments", pkr(paid)),
+                 ("Total remaining balances", pkr(max(total - paid, 0))),
+                 ("Estimated gross profit (Admin only)", pkr(sum(pm.values())))]),
+    ]
+
+    rows, note = cap_rows(sorted(owing, key=lambda s: -(num(s.get("total")) - num(s.get("paid_amount")))))
+    blocks.append(("h", "Remaining Customer Balances"))
+    if note:
+        blocks.append(("p", note))
+    blocks.append(("table", ["Invoice", "Customer", "Phone", "Date", "Total", "Paid", "Remaining"],
+                   [[s.get("invoice_no"), s.get("customer_name"), s.get("customer_phone"), str(s.get("sale_date"))[:10],
+                     pkr(s.get("total")), pkr(s.get("paid_amount")),
+                     pkr(num(s.get("total")) - num(s.get("paid_amount")))] for s in rows],
+                   [16, 22, 15, 12, 12, 12, 12], {4, 5, 6},
+                   ["TOTAL", "", "", "", pkr(sum(num(s.get('total')) for s in owing)),
+                    pkr(sum(num(s.get('paid_amount')) for s in owing)),
+                    pkr(sum(num(s.get('total')) - num(s.get('paid_amount')) for s in owing))] if owing else None))
+
+    rows, note = cap_rows(products)
+    blocks.append(("h", "Complete Product Inventory"))
+    blocks.append(("kpi", [("Total products", str(len(products))), ("Total stock units", str(units)),
+                           ("Inventory purchase value", pkr(buy_val)), ("Inventory selling value", pkr(sell_val))]))
+    if note:
+        blocks.append(("p", note))
+    blocks.append(("table", ["Product", "Category", "Model", "Processor", "RAM", "Storage", "Serial No", "Condition",
+                             "Qty", "Purchase", "Selling"],
+                   [[p.get("name"), p.get("category"), p.get("model"), p.get("processor"), p.get("ram"),
+                     p.get("storage"), p.get("serial_number"), p.get("condition_text"), int(num(p.get("quantity"))),
+                     pkr(p.get("purchase_price")), pkr(p.get("selling_price"))] for p in rows],
+                   [15, 8, 10, 13, 6, 8, 12, 8, 4, 9, 9], {8, 9, 10}, None))
+
+    rows, note = cap_rows(sales)
+    blocks.append(("h", f"Complete Sales History ({rng})"))
+    if note:
+        blocks.append(("p", note))
+    blocks.append(("table", ["Invoice", "Date", "Customer", "Phone", "Sold By", "Status", "Total", "Discount", "Paid", "Balance"],
+                   [[s.get("invoice_no"), str(s.get("sale_date"))[:10], s.get("customer_name"), s.get("customer_phone"),
+                     s.get("sold_by"), "Cancelled" if sale_status(s) == "cancelled" else "Active", pkr(s.get("total")),
+                     pkr(s.get("discount")), pkr(s.get("paid_amount")),
+                     "-" if sale_status(s) == "cancelled" else pkr(max(num(s.get("total")) - num(s.get("paid_amount")), 0))]
+                    for s in rows],
+                   [14, 9, 16, 12, 10, 8, 10, 9, 10, 10], {6, 7, 8, 9},
+                   ["TOTAL (active)", "", "", "", "", "", pkr(total), pkr(disc), pkr(paid), pkr(max(total - paid, 0))] if act else None))
+
+    rows, note = cap_rows(items)
+    blocks.append(("h", "Sale Items and Customer Details"))
+    blocks.append(("p", "Item profit = selling price x quantity minus purchase price x quantity (before invoice discounts)."))
+    if note:
+        blocks.append(("p", note))
+    trows = []
+    for i in rows:
+        s = by_id.get(i.get("sale_id"), {})
+        canc = sale_status(s) == "cancelled"
+        q = num(i.get("quantity"))
+        trows.append([f"{s.get('invoice_no')}{' (Cancelled)' if canc else ''}", s.get("customer_name"), s.get("customer_phone"),
+                      i.get("product_name"), i.get("specs"), int(q), pkr(i.get("selling_price")), pkr(i.get("purchase_price")),
+                      "-" if canc else pkr((num(i.get("selling_price")) - num(i.get("purchase_price"))) * q),
+                      str(i.get("warranty_expiry") or "")[:10]])
+    blocks.append(("table", ["Invoice", "Customer", "Phone", "Product", "Specs", "Qty", "Sell Price", "Purchase", "Profit", "Warranty Until"],
+                   trows, [14, 14, 11, 14, 20, 4, 9, 9, 9, 10], {5, 6, 7, 8}, None))
+
+    rows, note = cap_rows(pays)
+    blocks.append(("h", "Payment Records"))
+    if note:
+        blocks.append(("p", note))
+    blocks.append(("table", ["Payment ID", "Invoice", "Customer", "Amount", "Received By", "Note", "Date"],
+                   [[p.get("id"), by_id.get(p.get("sale_id"), {}).get("invoice_no"),
+                     by_id.get(p.get("sale_id"), {}).get("customer_name"), pkr(p.get("amount")), p.get("received_by"),
+                     p.get("note"), str(p.get("created_at") or p.get("payment_date") or "")[:16]] for p in rows],
+                   [8, 14, 16, 11, 12, 30, 14], {3}, None))
+    return build_pdf("Complete Backup Report", rng, blocks)
+
+
+def prepare_backup(kind, d1, d2):
+    """Build one export (zip / excel / pdf). Returns a dict describing the prepared file."""
+    require_admin()
+    now = backup_now()
+    who = current_username()
+    day = now.strftime("%Y-%m-%d")
+    base = f"Laptop_House_Buner_Backup_{day}"
+    tables = collect_backup_data()
+    counts = {key: len(tables[key]) for _, key in BACKUP_TABLES}
+    checks = []
+
+    if kind == "excel":
+        data = excel_backup(tables, now, who)
+        for title, exp, found in verify_excel(data, tables):
+            checks.append((exp == found, f"{title}: {found} of {exp} records in worksheet"))
+        name, mime = base + ".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+    elif kind == "pdf":
+        data = backup_pdf(tables, d1, d2, who)
+        checks.append((data[:4] == b"%PDF", f"Valid PDF file ({len(data) / 1024:,.0f} KB)"))
+        name, mime = base + ".pdf", "application/pdf"
+
+    else:
+        xlsx = excel_backup(tables, now, who)
+        in_sales = [s for s in tables["sales"] if in_range(s, d1, d2)]
+        ids = {s["id"] for s in in_sales}
+        in_items = [i for i in tables["sale_items"] if i.get("sale_id") in ids]
+        pdfs = {
+            "Complete_Backup_Report.pdf": backup_pdf(tables, d1, d2, who),
+            "Inventory_Report.pdf": inventory_pdf(tables["products"]),
+            "Sold_Products_Report.pdf": sales_pdf(in_sales, in_items, d1, d2),
+            "Sales_Summary.pdf": summary_pdf(in_sales, in_items, d1, d2),
+        }
+        info = "\n".join([
+            "LAPTOP HOUSE BUNER - BACKUP INFORMATION", "=" * 44,
+            f"Backup date & time : {now.strftime('%d %b %Y, %I:%M %p')} (Pakistan time)",
+            f"Created by         : {who}",
+            f"PDF sales range    : {d1.isoformat()} to {d2.isoformat()}",
+            "Database data      : ALL records (CSV and Excel are not date-filtered)", "",
+            "RECORD COUNTS"] + [f"  {title:<15}: {counts[key]}" for title, key in BACKUP_TABLES] + ["",
+            "CONTENTS",
+            f"  excel/{base}.xlsx    - one worksheet per table",
+            "  pdf/                 - 4 PDF reports",
+            "  data_csv/            - one CSV file per table", "",
+            "SECURITY",
+            "  Staff passwords and password hashes are NOT included.",
+            "  No Supabase secrets or credentials are included.",
+            "  Staff accounts contain only: id, username, role, created_at.",
+            "  Keep this file private: it contains purchase prices, profit and customer details."])
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr(f"{base}/backup_info.txt", info)
+            z.writestr(f"{base}/excel/{base}.xlsx", xlsx)
+            for n, b in pdfs.items():
+                z.writestr(f"{base}/pdf/{n}", b)
+            for _, key in BACKUP_TABLES:
+                csv = pd.DataFrame(tables[key], columns=table_columns(key, tables[key])).to_csv(index=False)
+                z.writestr(f"{base}/data_csv/{key}.csv", "\ufeff" + csv)
+        data = buf.getvalue()
+        name, mime = base + ".zip", "application/zip"
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            checks.append((z.testzip() is None, f"ZIP is valid and contains {len(z.namelist())} files"))
+            for title, key in BACKUP_TABLES:
+                text = z.read(f"{base}/data_csv/{key}.csv").decode("utf-8-sig")
+                found = len(pd.read_csv(io.StringIO(text)))
+                checks.append((found == counts[key], f"{title} CSV: {found} of {counts[key]} records"))
+            users_header = z.read(f"{base}/data_csv/users.csv").decode("utf-8-sig").splitlines()[0].lower()
+            checks.append(("password" not in users_header and "hash" not in users_header,
+                           "Staff file contains no password or hash column"))
+            checks.append((all(b[:4] == b"%PDF" for b in pdfs.values()), f"{len(pdfs)} PDF reports are valid"))
+        for title, exp, found in verify_excel(xlsx, tables):
+            checks.append((exp == found, f"Excel {title}: {found} of {exp} records"))
+
+    return {"data": data, "file_name": name, "mime": mime, "checks": checks, "counts": counts,
+            "time": now.strftime("%d %b %Y %I:%M %p"), "range": (d1, d2), "size": len(data)}
+
+
+def run_backup(kind, label, d1, d2):
+    try:
+        with st.spinner(f"Preparing {label}... this can take a moment for large data."):
+            item = prepare_backup(kind, d1, d2)
+    except PermissionError as e:
+        st.error(str(e))
+        return
+    except Exception as e:
+        st.session_state.pop(f"bk_{kind}", None)
+        st.error(f"{label} failed: {e}")
+        return
+    st.session_state[f"bk_{kind}"] = item
+    st.session_state.setdefault("bk_log", []).append(
+        {"Time": item["time"], "Type": label, "File": item["file_name"], "Size (KB)": round(item["size"] / 1024),
+         "Checks passed": f"{sum(1 for ok, _ in item['checks'] if ok)}/{len(item['checks'])}"})
+    if all(ok for ok, _ in item["checks"]):
+        st.success(f"{label} is ready. All data checks passed. Use the download button below.")
+        st.toast(f"{label} ready", icon="✅")
+    else:
+        st.warning(f"{label} was created, but some checks failed. Please read the check list below before relying on it.")
+
+
+def backup_center():
+    page_header("💾", "Backup & Export", "Download complete backups of your shop data")
+    if not is_admin():
+        st.error("Access denied. Backup & Export is for the Owner/Admin only.")
+        return
+    st.info("Backups are created on demand and downloaded to your device. Nothing is stored, deleted or overwritten on the "
+            "server. Staff passwords, password hashes and Supabase secrets are never included. "
+            "Keep downloaded files private: they contain purchase prices, profit and customer details.")
+
+    try:
+        sales = get_data("sales")
+    except Exception as e:
+        st.error(f"Could not read sales: {e}")
+        return
+    dates = [d for d in (parse_date(s.get("sale_date")) for s in sales) if d]
+    default = (min(dates) if dates else today_pk() - timedelta(days=29), max(today_pk(), max(dates) if dates else today_pk()))
+    rng = st.date_input("📅 Sales report date range (applies to PDF reports; Excel and CSV data always contain ALL records)",
+                        value=default, key="flt_bk_range")
+    if not (isinstance(rng, (tuple, list)) and len(rng) == 2):
+        st.info("Please select both a start date and an end date.")
+        return
+    d1, d2 = rng
+    if d1 > d2:
+        st.error("The start date must be before the end date.")
+        return
+
+    specs = [("zip", "📦", "Complete ZIP Backup", "ZIP", "One ZIP with the Excel workbook, 4 PDF reports, CSV data for every table and a backup information file."),
+             ("excel", "📗", "Excel Backup", "Excel", "One .xlsx workbook with a formatted worksheet per table, filters, frozen headers and backup date/time."),
+             ("pdf", "📕", "PDF Backup", "PDF", "Branded PDF: inventory, sales history, sale items, payments, totals, balances and gross profit.")]
+    cols = st.columns(3)
+    for col, (kind, icon, title, short, desc) in zip(cols, specs):
+        with col:
+            st.markdown(f"#### {icon} {title}")
+            st.caption(desc)
+            if st.button(f"Prepare {short} Backup", key=f"bk_btn_{kind}", type="primary"):
+                run_backup(kind, title, d1, d2)
+            item = st.session_state.get(f"bk_{kind}")
+            if item:
+                st.download_button(f"⬇️ Download {short} ({item['size'] / 1024:,.0f} KB)", item["data"],
+                                   file_name=item["file_name"], mime=item["mime"], key=f"bk_dl_{kind}")
+                st.caption(f"Prepared: {item['time']}  \nFile: {item['file_name']}")
+                if item["range"] != (d1, d2) and kind != "excel":
+                    st.warning("The date range changed after this file was prepared. Press Prepare again to update it.")
+                with st.expander("Data checks"):
+                    for ok, text in item["checks"]:
+                        st.write(("✅ " if ok else "❌ ") + text)
+
+    st.divider()
+    st.markdown("### 🕒 Backups prepared in this session")
+    log = st.session_state.get("bk_log", [])
+    if log:
+        show_table(pd.DataFrame(log[::-1][:20]))
+        if st.button("Clear prepared files from memory"):
+            for k in ("bk_zip", "bk_excel", "bk_pdf", "bk_log"):
+                st.session_state.pop(k, None)
+            st.rerun()
+    else:
+        empty_state("💾", "No backups prepared yet", "Press one of the Prepare buttons above.")
+    st.caption("Large data: PDF sections show up to 5,000 records each (the PDF says so when this happens). "
+               "The Excel and CSV files always contain every record.")
+
+
+# ==================================================================
+# ADMIN SETTINGS (RESET + MAINTENANCE) — ADMIN ONLY
 # ==================================================================
 def admin_settings():
     page_header("⚙️", "Admin Settings", "Backup, reset and maintenance tools")
     if not is_admin():
         st.error("Access denied. Admin settings are for the Owner/Admin only.")
         return
-    t1, t2, t3, t4 = st.tabs(["💾 Backup / Export", "🧹 Reset Products", "🗂️ Reset Sales / Payments", "🔄 Reset Filters"])
+    t1, t2, t3, t4 = st.tabs(["🔧 Maintenance", "🧹 Reset Products", "🗂️ Reset Sales / Payments", "🔄 Reset Filters"])
 
     with t1:
-        st.write("Download a backup of your data as a ZIP of CSV files. Password hashes are never included.")
-        if st.button("Prepare Full Backup"):
-            with st.spinner("Preparing backup..."):
-                tables = {t: get_data(t) for t in ("products", "sales", "sale_items", "payments", "users")}
-                for r in tables["users"]:
-                    r.pop("password_hash", None)
-                st.session_state["backup_zip"] = zip_bytes(tables)
-        if st.session_state.get("backup_zip"):
-            st.download_button("⬇️ Download Backup ZIP", st.session_state["backup_zip"],
-                               file_name=f"laptop_house_backup_{today_pk().isoformat()}.zip", mime="application/zip")
+        st.write("Full backups (ZIP, Excel and PDF) are now in the **💾 Backup & Export** page in the sidebar. "
+                 "Always download a backup before using any Reset option.")
         if st.button("Re-check database columns"):
             st.session_state.pop("_cols", None)
             st.success("Done. The app will re-check optional columns.")
@@ -1526,8 +1928,8 @@ def main():
     pages = {"🏠 Dashboard": dashboard, "📦 Products & Stock": products_page,
              "🧾 New Sale / Billing": billing_page, "📚 Sales History": sales_history}
     if admin:
-        pages.update({"📊 Reports & PDFs": reports, "👥 Staff Management": staff_management,
-                      "⚙️ Admin Settings": admin_settings})
+        pages.update({"📊 Reports & PDFs": reports, "💾 Backup & Export": backup_center,
+                      "👥 Staff Management": staff_management, "⚙️ Admin Settings": admin_settings})
     choice = st.sidebar.radio("Navigation", list(pages), label_visibility="collapsed")
     st.sidebar.divider()
     if st.sidebar.button("🚪 Logout"):
