@@ -245,7 +245,15 @@ def get_data(table):
         if len(chunk) < 1000:
             break
         start += 1000
-    return rows
+    seen, unique = set(), []
+    for r in rows:  # the same record is never counted twice
+        k = r.get("id")
+        if k is not None:
+            if k in seen:
+                continue
+            seen.add(k)
+        unique.append(r)
+    return unique
 
 
 def load_products():
@@ -776,7 +784,12 @@ def stock_value(p, price_field="purchase_price"):
 def stock_summary(products):
     names = ("Laptop", "Accessories", "Desktop", "Other")
     groups = {g: {"products": 0, "in_stock": 0, "units": 0, "value": 0.0, "selling": 0.0} for g in names}
+    seen = set()
     for p in products:
+        if p.get("id") is not None:
+            if p["id"] in seen:
+                continue  # distinct product records only
+            seen.add(p["id"])
         e = groups[category_group(p.get("category"))]
         q = max(int(num(p.get("quantity"))), 0)
         e["products"] += 1
@@ -844,25 +857,40 @@ def stock_investment_section(products):
     except PermissionError:
         return
     groups, total = stock_summary(products)
-    st.markdown("### 💼 Stock Investment (Admin only)")
-    cards([("💰", "Total Stock Value (purchase cost)", pkr_exact(total["value"]), "#12b76a")])
+    st.markdown("### 💼 Stock Investment Details (Admin only)")
     negative = [p for p in products if int(num(p.get("quantity"))) < 0]
     if negative:
         st.warning(f"{len(negative)} product(s) have negative stock and are counted as 0. "
                    "Please correct their quantity in Edit / Delete.")
-    st.caption("Total Value = available quantity × purchase price, summed over all products. Units already sold are never included.")
+    st.caption("Product Total Value = available quantity × purchase price. Category Total = sum of its products. "
+               "Grand Total = sum of all categories. Units already sold are never included.")
     with st.expander("📋 Stock value of every product"):
-        detail = sorted(
-            [{"Product": p.get("name"), "Model": p.get("model"), "Category": PRODUCT_GROUPS[category_group(p.get("category"))][1],
-              "Available Qty": max(int(num(p.get("quantity"))), 0), "Purchase Price": pkr_exact(num(p.get("purchase_price"))),
-              "Total Value": pkr_exact(stock_value(p)), "_v": stock_value(p)} for p in products], key=lambda r: -r["_v"])
-        if detail:
-            show_table(pd.DataFrame([{k: v for k, v in r.items() if k != "_v"} for r in detail]))
-            calc = round(sum(r["_v"] for r in detail), 2)
-            st.caption(("✅ " if abs(calc - total["value"]) < 0.01 else "❌ ") + f"Sum of all product values = {pkr_exact(calc)} "
-                       f"(grand total = {pkr_exact(total['value'])})")
+        titles = {PRODUCT_GROUPS[g][1]: g for g in groups}
+        pick = st.selectbox("Category", ["All Products"] + list(titles), key="flt_stock_cat")
+        chosen, seen = [], set()
+        for p in products:
+            if p.get("id") in seen:
+                continue
+            seen.add(p.get("id"))
+            if pick == "All Products" or category_group(p.get("category")) == titles[pick]:
+                chosen.append(p)
+        chosen.sort(key=lambda p: (-stock_value(p), str(p.get("name") or "")))
+        if not chosen:
+            st.caption("No products in this category.")
         else:
-            st.caption("No products yet.")
+            qty = sum(max(int(num(p.get("quantity"))), 0) for p in chosen)
+            value = round(sum(stock_value(p) for p in chosen), 2)
+            rows = [{"Product": p.get("name"), "Model": p.get("model"), "Category": PRODUCT_GROUPS[category_group(p.get("category"))][1],
+                     "Available Qty": max(int(num(p.get("quantity"))), 0), "Purchase Price": pkr_exact(num(p.get("purchase_price"))),
+                     "Total Value": pkr_exact(stock_value(p))} for p in chosen]
+            rows.append({"Product": "TOTAL", "Model": "", "Category": pick, "Available Qty": qty, "Purchase Price": "",
+                         "Total Value": pkr_exact(value)})
+            show_table(pd.DataFrame(rows))
+            expected = total["value"] if pick == "All Products" else groups[titles[pick]]["value"]
+            if abs(value - expected) < 0.01:
+                st.caption(f"✅ {pick}: {len(chosen)} product(s) | {qty:,} unit(s) | Total value {pkr_exact(value)} (matches the totals above)")
+            else:
+                st.caption(f"❌ {pick}: total {pkr_exact(value)} does not match {pkr_exact(expected)}")
 
 
 def stock_totals_section(products, admin):
@@ -872,18 +900,30 @@ def stock_totals_section(products, admin):
         except PermissionError:
             admin = False  # never show values unless Admin is confirmed in the database
     st.markdown("### 📦 Stock Count & Totals")
-    groups, _ = stock_summary(products)
-    cards([(PRODUCT_GROUPS[g][0], PRODUCT_GROUPS[g][1], f"{e['products']} product{'' if e['products'] == 1 else 's'} · {e['units']:,} unit{'' if e['units'] == 1 else 's'}", "#1f6feb")
-           for g, e in groups.items()])
+    groups, total = stock_summary(products)
+
+    def plural(n, word):
+        return f"{n:,} {word}{'' if n == 1 else 's'}"
+
+    cards([(PRODUCT_GROUPS[g][0], f"{PRODUCT_GROUPS[g][1]} ({plural(e['products'], 'product')})",
+            plural(e["units"], "unit") + (f" · {pkr_exact(e['value'])}" if admin else ""), "#1f6feb") for g, e in groups.items()])
+    grand = [("🗂️", "Grand Total Products", f"{total['products']:,}", "#0ea5e9"),
+             ("🧮", "Grand Total Quantity", f"{total['units']:,}", "#7c3aed")]
+    if admin:
+        grand.append(("💰", "Grand Total Purchase Value", pkr_exact(total["value"]), "#12b76a"))
+    cards(grand)
     stock_category_table(products, admin)
     if admin:
         stock_investment_section(products)
 
 
+ACCESSORY_WORDS = ("accessor", "mouse", "keyboard", "headphone", "earphone", "charger", "adapter", "cable", "speaker", "webcam")
+
+
 def category_group(category):
     """Maps any stored category text to one page. Every product lands on exactly one page."""
     t = str(category or "").strip().lower()
-    if "accessor" in t:
+    if any(w in t for w in ACCESSORY_WORDS):
         return "Accessories"
     if "laptop" in t or "notebook" in t or "macbook" in t:
         return "Laptop"
