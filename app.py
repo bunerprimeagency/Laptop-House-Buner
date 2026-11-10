@@ -461,8 +461,8 @@ def build_pdf(title, subtitle, blocks):
 def inventory_pdf(products):
     require_admin()
     units = sum(int(num(p.get("quantity"))) for p in products)
-    buy = sum(num(p.get("purchase_price")) * num(p.get("quantity")) for p in products)
-    sell = sum(num(p.get("selling_price")) * num(p.get("quantity")) for p in products)
+    buy = sum(stock_value(p) for p in products)
+    sell = sum(stock_value(p, "selling_price") for p in products)
     rows = [[p.get("name"), p.get("category"), p.get("model"), p.get("processor"), p.get("ram"),
              p.get("storage"), p.get("serial_number"), p.get("condition_text"),
              int(num(p.get("quantity"))), pkr(p.get("purchase_price")), pkr(p.get("selling_price"))]
@@ -705,7 +705,7 @@ def dashboard():
         start = today_pk() - timedelta(days=days)
         sales = [s for s in sales if (parse_date(s.get("sale_date")) or date.min) >= start]
 
-    stock = sum(int(num(p.get("quantity"))) for p in products)
+    stock = sum(max(int(num(p.get("quantity"))), 0) for p in products)
     if admin:
         total = sum(num(s.get("total")) for s in sales)
         pending = sum(max(num(s.get("total")) - num(s.get("paid_amount")), 0) for s in sales)
@@ -717,6 +717,9 @@ def dashboard():
         cards([("📦", "Total Products", len(products), "#1f6feb"), ("🧮", "Stock Units", stock, "#7c3aed"),
                ("🧾", f"My Invoices ({period})", len(mine), "#0ea5e9"),
                ("💰", "My Sales", pkr(sum(num(s.get("total")) for s in mine)), "#12b76a")])
+
+    if admin:
+        stock_investment_section(products)
 
     c1, c2 = st.columns(2)
     with c1:
@@ -756,6 +759,109 @@ PRODUCT_GROUPS = {
 }
 
 
+# ---------- stock value (ADMIN ONLY: uses purchase prices) ----------
+def pkr_exact(value):
+    """Rs with no decimals for whole rupees, 2 decimals only when needed (so totals always add up on screen)."""
+    try:
+        v = round(float(value or 0), 2)
+    except Exception:
+        return "Rs 0"
+    return f"Rs {v:,.0f}" if abs(v - round(v)) < 0.005 else f"Rs {v:,.2f}"
+
+
+def stock_value(p, price_field="purchase_price"):
+    """Available quantity x price. Sold units are already removed from 'quantity', so they are never included."""
+    return max(int(num(p.get("quantity"))), 0) * num(p.get(price_field))
+
+
+def stock_summary(products):
+    names = ("Laptop", "Accessories", "Desktop", "Other")
+    groups = {g: {"products": 0, "in_stock": 0, "units": 0, "value": 0.0, "selling": 0.0} for g in names}
+    for p in products:
+        e = groups[category_group(p.get("category"))]
+        q = max(int(num(p.get("quantity"))), 0)
+        e["products"] += 1
+        e["in_stock"] += 1 if q > 0 else 0
+        e["units"] += q
+        e["value"] += stock_value(p)
+        e["selling"] += stock_value(p, "selling_price")
+    total = {k: sum(groups[g][k] for g in names) for k in ("products", "in_stock", "units", "value", "selling")}
+    for e in list(groups.values()) + [total]:
+        e["value"] = round(e["value"], 2)
+        e["selling"] = round(e["selling"], 2)
+    return groups, total
+
+
+def restock_calc(cur_qty, old_price, add_qty, unit_cost, weighted):
+    """New quantity and purchase price after adding stock (weighted average uses only units really in stock)."""
+    base = max(int(cur_qty), 0)
+    new_qty = int(cur_qty) + int(add_qty)
+    if not weighted:
+        new_price = old_price
+    elif base <= 0:
+        new_price = unit_cost
+    else:
+        new_price = round((base * old_price + add_qty * unit_cost) / (base + add_qty), 4)
+    return new_qty, new_price
+
+
+def add_stock(pid, add_qty, unit_cost, weighted):
+    """Adds purchased units to an existing product (same product ID, no duplicate). Admin only."""
+    require_admin()
+    if int(add_qty) <= 0 or unit_cost < 0:
+        raise ValueError("Quantity must be at least 1 and the price cannot be negative.")
+    for _ in range(3):
+        rows = supabase.table("products").select("id,quantity,purchase_price").eq("id", pid).limit(1).execute().data
+        if not rows:
+            raise ValueError("Product not found. It may have been deleted.")
+        cur, old_pp = int(num(rows[0].get("quantity"))), num(rows[0].get("purchase_price"))
+        new_qty, new_pp = restock_calc(cur, old_pp, int(add_qty), unit_cost, weighted)
+        upd = {"quantity": new_qty}
+        if new_pp != old_pp:
+            upd["purchase_price"] = new_pp
+        done = supabase.table("products").update(upd).eq("id", pid).eq("quantity", cur).execute().data
+        if done:
+            return {"old_qty": cur, "new_qty": new_qty, "old_pp": old_pp, "new_pp": new_pp}
+    raise ValueError("Stock changed while saving. Please try again.")
+
+
+def stock_investment_section(products):
+    try:
+        require_admin()  # backend check: staff can never reach purchase values
+    except PermissionError:
+        return
+    groups, total = stock_summary(products)
+    st.markdown("### 💼 Stock Investment (Admin only)")
+    cards([("💰", "Total Stock Value (purchase cost)", pkr_exact(total["value"]), "#12b76a"),
+           ("🧮", "Total Stock Quantity", f"{total['units']:,}", "#7c3aed"),
+           ("📦", "Products In Stock", f"{total['in_stock']} of {total['products']}", "#1f6feb"),
+           ("🏷️", "Stock Value at Selling Price", pkr_exact(total["selling"]), "#0ea5e9")])
+    cards([(PRODUCT_GROUPS[g][0], PRODUCT_GROUPS[g][1], pkr_exact(groups[g]["value"]), "#1f6feb") for g in groups])
+    rows = [{"Category": PRODUCT_GROUPS[g][1], "Products": e["products"], "In Stock": e["in_stock"], "Units": e["units"],
+             "Stock Value (Cost)": e["value"], "Value at Selling Price": e["selling"]} for g, e in groups.items()]
+    rows.append({"Category": "GRAND TOTAL", "Products": total["products"], "In Stock": total["in_stock"], "Units": total["units"],
+                 "Stock Value (Cost)": total["value"], "Value at Selling Price": total["selling"]})
+    show_table(pd.DataFrame(rows))
+    st.bar_chart(pd.DataFrame({"Stock Value (Cost)": [groups[g]["value"] for g in groups]},
+                              index=[PRODUCT_GROUPS[g][1] for g in groups]))
+    st.caption("Total Value = available quantity × purchase price, summed over all products. Units already sold are never included.")
+    with st.expander("📋 Stock value of every product"):
+        detail = sorted(
+            [{"Product": p.get("name"), "Model": p.get("model"), "Category": PRODUCT_GROUPS[category_group(p.get("category"))][1],
+              "Available Qty": max(int(num(p.get("quantity"))), 0), "Purchase Price": num(p.get("purchase_price")),
+              "Total Value": round(stock_value(p), 2)} for p in products], key=lambda r: -r["Total Value"])
+        if detail:
+            df = pd.DataFrame(detail)
+            show_table(df)
+            calc = round(sum(r["Total Value"] for r in detail), 2)
+            st.caption(("✅ " if abs(calc - total["value"]) < 0.01 else "❌ ") + f"Sum of all product values = {pkr_exact(calc)} "
+                       f"(grand total = {pkr_exact(total['value'])})")
+            st.download_button("⬇️ Download stock value report (CSV)", df.to_csv(index=False),
+                               file_name=f"stock_value_{today_pk().isoformat()}.csv", mime="text/csv")
+        else:
+            st.caption("No products yet.")
+
+
 def category_group(category):
     """Maps any stored category text to one page. Every product lands on exactly one page."""
     t = str(category or "").strip().lower()
@@ -786,6 +892,8 @@ def inventory_view(products, admin, slug="All", empty_title="No products yet"):
             row["Purchase Price"] = num(p.get("purchase_price"))
         row["Selling Price"] = num(p.get("selling_price"))
         row["Qty"] = int(num(p.get("quantity")))
+        if admin:
+            row["Stock Value (Cost)"] = round(stock_value(p), 2)
         row["Warranty Days"] = int(num(p.get("warranty_days")))
         row["Warranty Terms"] = p.get("warranty_terms")
         rows.append(row)
@@ -794,6 +902,9 @@ def inventory_view(products, admin, slug="All", empty_title="No products yet"):
         empty_state("🔍", "No match", "No product matches your search.")
     else:
         show_table(df)
+        if admin and "Stock Value (Cost)" in df.columns:
+            st.markdown(f"**Total stock value of the products shown (cost): {pkr_exact(df['Stock Value (Cost)'].sum())}** "
+                        f"| Units: {int(df['Qty'].clip(lower=0).sum()):,}")
 
 
 def product_form_fields(prefix, p=None, default_cat=None):
@@ -862,6 +973,49 @@ def add_product_tab(products, group="All"):
             st.error(f"Save failed: {e}")
 
 
+def add_stock_tab(products, group="All"):
+    if not products:
+        empty_state("📥", "No products on this page", "Add a product first, then add stock to it here.")
+        return
+    ids = [p["id"] for p in products]
+    labels = {p["id"]: f'#{p["id"]} - {p.get("name")} {p.get("model") or ""} (Stock {int(num(p.get("quantity")))})' for p in products}
+    pid = st.selectbox("Select product", ids, format_func=lambda i: labels[i], key=f"stk_pid_{group}")
+    p = next(x for x in products if x["id"] == pid)
+    cur_q, cur_pp = int(num(p.get("quantity"))), num(p.get("purchase_price"))
+    cards([("🧮", "Current Stock", cur_q, "#7c3aed"), ("💵", "Purchase Price / Unit", pkr_exact(cur_pp), "#1f6feb"),
+           ("💰", "Current Stock Value", pkr_exact(stock_value(p)), "#12b76a")])
+    c1, c2 = st.columns(2)
+    add_qty = c1.number_input("Quantity to add", min_value=1, value=1, step=1, key=f"stk_q_{group}_{pid}")
+    unit_cost = c2.number_input("Purchase price per unit for this purchase (Rs)", min_value=0.0, value=cur_pp, step=500.0,
+                                key=f"stk_c_{group}_{pid}")
+    mode = st.radio("Purchase price after adding", ["Weighted average of old and new stock (recommended)", "Keep current purchase price"],
+                    key=f"stk_m_{group}_{pid}")
+    weighted = mode.startswith("Weighted")
+    new_q, new_pp = restock_calc(cur_q, cur_pp, int(add_qty), float(unit_cost), weighted)
+    new_val = max(new_q, 0) * new_pp
+    cards([("🧮", "New Stock", new_q, "#7c3aed"), ("💵", "New Purchase Price / Unit", pkr_exact(new_pp), "#1f6feb"),
+           ("💰", "New Stock Value", pkr_exact(new_val), "#12b76a"), ("➕", "Value Added", pkr_exact(new_val - stock_value(p)), "#0ea5e9")])
+    st.caption("This updates the same product (no duplicate is created) and past sales are not changed. "
+               "To record the money you paid, add an expense under Income & Expenses (Laptop / Accessories Purchasing).")
+    ok = st.checkbox("I confirm this stock was purchased and should be added", key=f"stk_ok_{group}_{pid}")
+    if st.button("📥 Add Stock", type="primary", disabled=not ok, key=f"stk_b_{group}_{pid}"):
+        fp = (pid, int(add_qty), round(float(unit_cost), 2), weighted)
+        last = st.session_state.get("stock_last_fp")
+        if last and last[0] == fp and (datetime.now() - last[1]).total_seconds() < 60:
+            st.error("This same stock addition was saved a moment ago. Blocked to avoid adding it twice.")
+            return
+        try:
+            res = add_stock(pid, int(add_qty), float(unit_cost), weighted)
+            st.session_state["stock_last_fp"] = (fp, datetime.now())
+            flash("success", f"Added {int(add_qty)} unit(s) to {p.get('name')}. Stock is now {res['new_qty']}, "
+                             f"purchase price {pkr_exact(res['new_pp'])}, stock value {pkr_exact(max(res['new_qty'], 0) * res['new_pp'])}.")
+            st.rerun()
+        except PermissionError as e:
+            st.error(str(e))
+        except Exception as e:
+            st.error(f"Could not add stock: {e}")
+
+
 def edit_delete_tab(products, all_products, group="All"):
     if not products:
         empty_state("✏️", "Nothing to edit", "There are no products on this page yet.")
@@ -870,6 +1024,8 @@ def edit_delete_tab(products, all_products, group="All"):
     labels = {p["id"]: f'#{p["id"]} - {p.get("name")} {p.get("model") or ""} (Stock {int(num(p.get("quantity")))})' for p in products}
     pid = st.selectbox("Select product", ids, format_func=lambda i: labels[i], key=f"edit_pid_{group}")
     p = next(x for x in products if x["id"] == pid)
+    st.caption(f"Current stock: {int(num(p.get('quantity')))} | Purchase price: {pkr_exact(num(p.get('purchase_price')))} | "
+               f"Stock value: {pkr_exact(stock_value(p))}. Saving new quantity or price recalculates all totals.")
 
     with st.form(f"edit_form_{pid}"):
         st.markdown("### ✏️ Edit Product")
@@ -932,8 +1088,8 @@ def product_cards(products, admin, group, all_products):
              ("⚠️", f"Low Stock (1 to {low_limit})", sum(1 for q in qty if 0 < q <= low_limit), "#f79009"),
              ("🚫", "Out of Stock", sum(1 for q in qty if q <= 0), "#d92d20")]
     if admin:
-        items.append(("💰", "Stock Value (cost)", pkr(sum(num(p.get("purchase_price")) * int(num(p.get("quantity"))) for p in products)), "#12b76a"))
-        items.append(("🏷️", "Stock Value (selling)", pkr(sum(num(p.get("selling_price")) * int(num(p.get("quantity"))) for p in products)), "#0ea5e9"))
+        items.append(("💰", "Stock Value (cost)", pkr_exact(sum(stock_value(p) for p in products)), "#12b76a"))
+        items.append(("🏷️", "Stock Value (selling)", pkr_exact(sum(stock_value(p, "selling_price") for p in products)), "#0ea5e9"))
     cards(items)
     if group == "All":
         counts = {g: sum(1 for p in all_products if category_group(p.get("category")) == g) for g in ("Laptop", "Accessories", "Desktop", "Other")}
@@ -955,12 +1111,14 @@ def products_page(group="All"):
     if not admin:
         inventory_view(products, False, group, empty_title)
         return
-    t1, t2, t3 = st.tabs(["📋 Inventory", "➕ Add Product", "✏️ Edit / Delete"])
+    t1, t2, t3, t4 = st.tabs(["📋 Inventory", "➕ Add Product", "📥 Add Stock", "✏️ Edit / Delete"])
     with t1:
         inventory_view(products, True, group, empty_title)
     with t2:
         add_product_tab(all_products, group)
     with t3:
+        add_stock_tab(products, group)
+    with t4:
         edit_delete_tab(products, all_products, group)
 
 
@@ -1336,7 +1494,8 @@ def reports():
         remaining = sum(max(num(s.get("total")) - num(s.get("paid_amount")), 0) for s in sales)
         profit = sum(profit_map(sales, items).values())
         cards([("📦", "Total Products", len(products), "#1f6feb"),
-               ("🧮", "Total Stock Units", sum(int(num(p.get("quantity"))) for p in products), "#7c3aed"),
+               ("🧮", "Total Stock Units", sum(max(int(num(p.get("quantity"))), 0) for p in products), "#7c3aed"),
+               ("💼", "Stock Value (purchase cost)", pkr_exact(sum(stock_value(p) for p in products)), "#12b76a"),
                ("🧾", "Total Invoices", len(sales), "#0ea5e9"), ("💰", "Total Sales", pkr(total), "#12b76a"),
                ("💵", "Received Payments", pkr(received), "#16a34a"), ("⏳", "Remaining Balances", pkr(remaining), "#f79009"),
                ("📈", "Estimated Gross Profit", pkr(profit), "#db2777")])
@@ -1605,7 +1764,7 @@ def build_fin_context(raw):
     return {"active": active, "income": income, "expenses": expenses, "cost_by_sale": cost_by_sale,
             "invoice_nos": {str(s.get("invoice_no", "")).strip().lower() for s in sales},
             "raw_income": raw_income, "raw_expenses": raw_exp, "mismatch": mismatch, "pay_sum": pay_sum,
-            "stock_cost": sum(num(p.get("purchase_price")) * num(p.get("quantity")) for p in raw["products"])}
+            "stock_cost": sum(stock_value(p) for p in raw["products"])}
 
 
 def fin_calc(ctx, d1, d2):
@@ -2507,8 +2666,8 @@ def backup_pdf(tables, d1, d2, who):
     disc = sum(num(s.get("discount")) for s in act)
     owing = [s for s in act if num(s.get("total")) - num(s.get("paid_amount")) > 0.5]
     units = sum(int(num(p.get("quantity"))) for p in products)
-    buy_val = sum(num(p.get("purchase_price")) * num(p.get("quantity")) for p in products)
-    sell_val = sum(num(p.get("selling_price")) * num(p.get("quantity")) for p in products)
+    buy_val = sum(stock_value(p) for p in products)
+    sell_val = sum(stock_value(p, "selling_price") for p in products)
     rng = f"{d1.strftime('%d %b %Y')} to {d2.strftime('%d %b %Y')}"
     blocks = [
         ("h", "Report Information"),
