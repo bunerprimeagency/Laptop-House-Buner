@@ -1425,6 +1425,10 @@ alter table business_expenses enable row level security;"""
 
 # ---------------- backend: permissions + database writes ----------------
 def fin_tables_ok():
+    cache = st.session_state.setdefault("_cols", {})
+    for t in ("business_income", "business_expenses"):
+        if not cache.get(f"{t}.id"):
+            cache.pop(f"{t}.id", None)  # never trust a cached "missing": re-check every time
     return col_exists("business_income", "id") and col_exists("business_expenses", "id")
 
 
@@ -2192,7 +2196,12 @@ def finance_page():
         st.warning("The Income and Expense tables are not created yet. Run the SQL below once in Supabase "
                    "(SQL Editor → New query → Run), then press the button. Sales-based figures work meanwhile.")
         with st.expander("Show the SQL"):
-            st.code(FIN_SQL, language="sql")
+            st.code(FIN_SQL + "\n\nnotify pgrst, 'reload schema';", language="sql")
+        for t in ("business_income", "business_expenses"):
+            try:
+                supabase.table(t).select("id").limit(1).execute()
+            except Exception as e:
+                st.caption(f"Database says for {t}: {e}")
         if st.button("Re-check database"):
             st.session_state.pop("_cols", None)
             st.rerun()
