@@ -718,8 +718,7 @@ def dashboard():
                ("🧾", f"My Invoices ({period})", len(mine), "#0ea5e9"),
                ("💰", "My Sales", pkr(sum(num(s.get("total")) for s in mine)), "#12b76a")])
 
-    if admin:
-        stock_investment_section(products)
+    stock_totals_section(products, admin)
 
     c1, c2 = st.columns(2)
     with c1:
@@ -825,6 +824,20 @@ def add_stock(pid, add_qty, unit_cost, weighted):
     raise ValueError("Stock changed while saving. Please try again.")
 
 
+def stock_category_table(products, admin):
+    """Products and available quantity per category plus a grand total. Purchase value is shown to Admin only."""
+    groups, total = stock_summary(products)
+
+    def line(name, e):
+        row = {"Category": name, "Products": e["products"], "Available Qty": e["units"]}
+        if admin:
+            row["Total Purchase Value"] = pkr_exact(e["value"])
+        return row
+
+    show_table(pd.DataFrame([line(PRODUCT_GROUPS[g][1], e) for g, e in groups.items()] + [line("GRAND TOTAL", total)]))
+    return groups, total
+
+
 def stock_investment_section(products):
     try:
         require_admin()  # backend check: staff can never reach purchase values
@@ -832,34 +845,39 @@ def stock_investment_section(products):
         return
     groups, total = stock_summary(products)
     st.markdown("### 💼 Stock Investment (Admin only)")
-    cards([("💰", "Total Stock Value (purchase cost)", pkr_exact(total["value"]), "#12b76a"),
-           ("🧮", "Total Stock Quantity", f"{total['units']:,}", "#7c3aed"),
-           ("📦", "Products In Stock", f"{total['in_stock']} of {total['products']}", "#1f6feb"),
-           ("🏷️", "Stock Value at Selling Price", pkr_exact(total["selling"]), "#0ea5e9")])
-    cards([(PRODUCT_GROUPS[g][0], PRODUCT_GROUPS[g][1], pkr_exact(groups[g]["value"]), "#1f6feb") for g in groups])
-    rows = [{"Category": PRODUCT_GROUPS[g][1], "Products": e["products"], "In Stock": e["in_stock"], "Units": e["units"],
-             "Stock Value (Cost)": e["value"], "Value at Selling Price": e["selling"]} for g, e in groups.items()]
-    rows.append({"Category": "GRAND TOTAL", "Products": total["products"], "In Stock": total["in_stock"], "Units": total["units"],
-                 "Stock Value (Cost)": total["value"], "Value at Selling Price": total["selling"]})
-    show_table(pd.DataFrame(rows))
-    st.bar_chart(pd.DataFrame({"Stock Value (Cost)": [groups[g]["value"] for g in groups]},
-                              index=[PRODUCT_GROUPS[g][1] for g in groups]))
+    cards([("💰", "Total Stock Value (purchase cost)", pkr_exact(total["value"]), "#12b76a")])
+    negative = [p for p in products if int(num(p.get("quantity"))) < 0]
+    if negative:
+        st.warning(f"{len(negative)} product(s) have negative stock and are counted as 0. "
+                   "Please correct their quantity in Edit / Delete.")
     st.caption("Total Value = available quantity × purchase price, summed over all products. Units already sold are never included.")
     with st.expander("📋 Stock value of every product"):
         detail = sorted(
             [{"Product": p.get("name"), "Model": p.get("model"), "Category": PRODUCT_GROUPS[category_group(p.get("category"))][1],
-              "Available Qty": max(int(num(p.get("quantity"))), 0), "Purchase Price": num(p.get("purchase_price")),
-              "Total Value": round(stock_value(p), 2)} for p in products], key=lambda r: -r["Total Value"])
+              "Available Qty": max(int(num(p.get("quantity"))), 0), "Purchase Price": pkr_exact(num(p.get("purchase_price"))),
+              "Total Value": pkr_exact(stock_value(p)), "_v": stock_value(p)} for p in products], key=lambda r: -r["_v"])
         if detail:
-            df = pd.DataFrame(detail)
-            show_table(df)
-            calc = round(sum(r["Total Value"] for r in detail), 2)
+            show_table(pd.DataFrame([{k: v for k, v in r.items() if k != "_v"} for r in detail]))
+            calc = round(sum(r["_v"] for r in detail), 2)
             st.caption(("✅ " if abs(calc - total["value"]) < 0.01 else "❌ ") + f"Sum of all product values = {pkr_exact(calc)} "
                        f"(grand total = {pkr_exact(total['value'])})")
-            st.download_button("⬇️ Download stock value report (CSV)", df.to_csv(index=False),
-                               file_name=f"stock_value_{today_pk().isoformat()}.csv", mime="text/csv")
         else:
             st.caption("No products yet.")
+
+
+def stock_totals_section(products, admin):
+    if admin:
+        try:
+            require_admin()
+        except PermissionError:
+            admin = False  # never show values unless Admin is confirmed in the database
+    st.markdown("### 📦 Stock Count & Totals")
+    groups, _ = stock_summary(products)
+    cards([(PRODUCT_GROUPS[g][0], PRODUCT_GROUPS[g][1], f"{e['products']} product{'' if e['products'] == 1 else 's'} · {e['units']:,} unit{'' if e['units'] == 1 else 's'}", "#1f6feb")
+           for g, e in groups.items()])
+    stock_category_table(products, admin)
+    if admin:
+        stock_investment_section(products)
 
 
 def category_group(category):
@@ -1094,6 +1112,7 @@ def product_cards(products, admin, group, all_products):
     if group == "All":
         counts = {g: sum(1 for p in all_products if category_group(p.get("category")) == g) for g in ("Laptop", "Accessories", "Desktop", "Other")}
         cards([(PRODUCT_GROUPS[g][0], PRODUCT_GROUPS[g][1], counts[g], "#1f6feb") for g in counts])
+        stock_category_table(all_products, admin)
     if group == "Other":
         found = sorted({str(p.get("category") or "(no category)") for p in products})
         if found:
