@@ -746,11 +746,33 @@ def option_index(options, value):
     return options.index(value) if value in options else 0
 
 
-def inventory_view(products, admin):
+# Product pages. Products are grouped by their existing "category" text. Nothing is changed in the database.
+PRODUCT_GROUPS = {
+    "Laptop": ("💻", "Laptops", "Laptop products, specifications and stock", "Laptop"),
+    "Accessories": ("🎧", "Accessories", "Accessories, parts and add-ons", "Accessories"),
+    "Desktop": ("🖥️", "Desktop Computers", "Desktop computers and all-in-one PCs", "Desktop"),
+    "Other": ("📦", "Other Products", "Products in any other category", "Other"),
+    "All": ("🗂️", "All Products", "Every product in your inventory", "Laptop"),
+}
+
+
+def category_group(category):
+    """Maps any stored category text to one page. Every product lands on exactly one page."""
+    t = str(category or "").strip().lower()
+    if "accessor" in t:
+        return "Accessories"
+    if "laptop" in t or "notebook" in t or "macbook" in t:
+        return "Laptop"
+    if "desktop" in t or "computer" in t or "all in one" in t or "all-in-one" in t or "pc" in t.replace("-", " ").split():
+        return "Desktop"
+    return "Other"
+
+
+def inventory_view(products, admin, slug="All", empty_title="No products yet"):
     if not products:
-        empty_state("📦", "No products yet", "Products added by the Owner will appear here.")
+        empty_state("📦", empty_title, "Products added by the Owner will appear here.")
         return
-    search = st.text_input("🔍 Search (name, model, processor, serial)", key="flt_prod_search")
+    search = st.text_input("🔍 Search (name, model, processor, serial)", key=f"flt_prod_search_{slug}")
     rows = []
     for p in products:
         text = " ".join(str(p.get(k, "")) for k in ("name", "model", "processor", "serial_number", "ram", "storage")).lower()
@@ -774,12 +796,12 @@ def inventory_view(products, admin):
         show_table(df)
 
 
-def product_form_fields(prefix, p=None):
+def product_form_fields(prefix, p=None, default_cat=None):
     p = p or {}
     c1, c2, c3 = st.columns(3)
     name = c1.text_input("Product Name", value=p.get("name") or "", key=f"{prefix}_name")
     cats = CATEGORIES + ([p["category"]] if p.get("category") and p["category"] not in CATEGORIES else [])
-    category = c2.selectbox("Category", cats, index=option_index(cats, p.get("category")), key=f"{prefix}_cat")
+    category = c2.selectbox("Category", cats, index=option_index(cats, p.get("category") or default_cat), key=f"{prefix}_cat")
     model = c3.text_input("Model", value=p.get("model") or "", key=f"{prefix}_model")
     c4, c5, c6 = st.columns(3)
     processor = c4.text_input("Processor", value=p.get("processor") or "", key=f"{prefix}_cpu")
@@ -815,10 +837,10 @@ def validate_product(base, products, own_id=None):
     return None
 
 
-def add_product_tab(products):
-    with st.form("add_product", clear_on_submit=True):
+def add_product_tab(products, group="All"):
+    with st.form(f"add_product_{group}", clear_on_submit=True):
         st.markdown("### ➕ Add New Product")
-        base, extras = product_form_fields("add")
+        base, extras = product_form_fields(f"add_{group}", None, PRODUCT_GROUPS[group][3])
         submit = st.form_submit_button("💾 Save Product", type="primary")
     if submit:
         try:
@@ -829,7 +851,7 @@ def add_product_tab(products):
                 return
             data, skipped = with_optional("products", base, extras)
             supabase.table("products").insert(data).execute()
-            msg = "Product saved successfully."
+            msg = f"Product saved successfully. It appears under {PRODUCT_GROUPS[category_group(base['category'])][1]}."
             if skipped:
                 msg += f" (Not saved because columns are missing in Supabase: {', '.join(skipped)} — see the SQL migration.)"
             flash("success", msg)
@@ -840,13 +862,13 @@ def add_product_tab(products):
             st.error(f"Save failed: {e}")
 
 
-def edit_delete_tab(products):
+def edit_delete_tab(products, all_products, group="All"):
     if not products:
-        empty_state("✏️", "Nothing to edit", "Add a product first.")
+        empty_state("✏️", "Nothing to edit", "There are no products on this page yet.")
         return
     ids = [p["id"] for p in products]
     labels = {p["id"]: f'#{p["id"]} - {p.get("name")} {p.get("model") or ""} (Stock {int(num(p.get("quantity")))})' for p in products}
-    pid = st.selectbox("Select product", ids, format_func=lambda i: labels[i], key="edit_pid")
+    pid = st.selectbox("Select product", ids, format_func=lambda i: labels[i], key=f"edit_pid_{group}")
     p = next(x for x in products if x["id"] == pid)
 
     with st.form(f"edit_form_{pid}"):
@@ -856,13 +878,15 @@ def edit_delete_tab(products):
     if save:
         try:
             require_admin()
-            err = validate_product(base, products, own_id=pid)
+            err = validate_product(base, all_products, own_id=pid)
             if err:
                 st.error(err)
             else:
                 data, skipped = with_optional("products", base, extras)
                 supabase.table("products").update(data).eq("id", pid).execute()
                 msg = "Product updated."
+                if category_group(base["category"]) != category_group(p.get("category")):
+                    msg += f" It now appears under {PRODUCT_GROUPS[category_group(base['category'])][1]}."
                 if skipped:
                     msg += f" (Columns missing in Supabase, not saved: {', '.join(skipped)}.)"
                 flash("success", msg)
@@ -901,20 +925,43 @@ def edit_delete_tab(products):
                 st.error(f"Delete failed: {e}")
 
 
-def products_page():
-    page_header("📦", "Products & Stock", "Inventory, specifications and prices")
+def product_cards(products, admin, group, all_products):
+    low_limit = int(st.session_state.get("set_low_stock", 3))
+    qty = [int(num(p.get("quantity"))) for p in products]
+    items = [("📦", "Products", len(products), "#1f6feb"), ("🧮", "Stock Units", sum(qty), "#7c3aed"),
+             ("⚠️", f"Low Stock (1 to {low_limit})", sum(1 for q in qty if 0 < q <= low_limit), "#f79009"),
+             ("🚫", "Out of Stock", sum(1 for q in qty if q <= 0), "#d92d20")]
+    if admin:
+        items.append(("💰", "Stock Value (cost)", pkr(sum(num(p.get("purchase_price")) * int(num(p.get("quantity"))) for p in products)), "#12b76a"))
+        items.append(("🏷️", "Stock Value (selling)", pkr(sum(num(p.get("selling_price")) * int(num(p.get("quantity"))) for p in products)), "#0ea5e9"))
+    cards(items)
+    if group == "All":
+        counts = {g: sum(1 for p in all_products if category_group(p.get("category")) == g) for g in ("Laptop", "Accessories", "Desktop", "Other")}
+        cards([(PRODUCT_GROUPS[g][0], PRODUCT_GROUPS[g][1], counts[g], "#1f6feb") for g in counts])
+    if group == "Other":
+        found = sorted({str(p.get("category") or "(no category)") for p in products})
+        if found:
+            st.caption("Categories shown on this page: " + ", ".join(found))
+
+
+def products_page(group="All"):
+    icon, title, sub, _ = PRODUCT_GROUPS[group]
+    page_header(icon, title, sub)
     admin = is_admin()
-    products = load_products()
+    all_products = load_products()
+    products = all_products if group == "All" else [p for p in all_products if category_group(p.get("category")) == group]
+    product_cards(products, admin, group, all_products)
+    empty_title = f"No products in {title} yet"
     if not admin:
-        inventory_view(products, False)
+        inventory_view(products, False, group, empty_title)
         return
     t1, t2, t3 = st.tabs(["📋 Inventory", "➕ Add Product", "✏️ Edit / Delete"])
     with t1:
-        inventory_view(products, True)
+        inventory_view(products, True, group, empty_title)
     with t2:
-        add_product_tab(products)
+        add_product_tab(all_products, group)
     with t3:
-        edit_delete_tab(products)
+        edit_delete_tab(products, all_products, group)
 
 
 # ==================================================================
@@ -951,7 +998,7 @@ def billing_page():
 
     products = [p for p in load_products() if int(num(p.get("quantity"))) > 0]
     if not products:
-        empty_state("📦", "No stock available", "Add products or stock first in Products & Stock.")
+        empty_state("📦", "No stock available", "Add products or stock first in the Laptops, Accessories, Desktop or Other Products pages.")
         return
 
     nonce = st.session_state.setdefault("sale_nonce", 0)
@@ -1420,7 +1467,12 @@ create table if not exists business_expenses (
 create index if not exists idx_business_expenses_date on business_expenses (expense_date);
 
 alter table business_income enable row level security;
-alter table business_expenses enable row level security;"""
+alter table business_expenses enable row level security;
+
+grant usage on schema public to service_role;
+grant select, insert, update, delete on public.business_income to service_role;
+grant select, insert, update, delete on public.business_expenses to service_role;
+grant usage, select on all sequences in schema public to service_role;"""
 
 
 # ---------------- backend: permissions + database writes ----------------
@@ -2815,7 +2867,12 @@ def main():
         f'<small>{"Owner / Admin" if admin else "Staff"}</small></div>', unsafe_allow_html=True)
     st.sidebar.divider()
 
-    pages = {"🏠 Dashboard": dashboard, "📦 Products & Stock": products_page,
+    pages = {"🏠 Dashboard": dashboard,
+             "💻 Laptops": lambda: products_page("Laptop"),
+             "🎧 Accessories": lambda: products_page("Accessories"),
+             "🖥️ Desktop Computers": lambda: products_page("Desktop"),
+             "📦 Other Products": lambda: products_page("Other"),
+             "🗂️ All Products": lambda: products_page("All"),
              "🧾 New Sale / Billing": billing_page, "📚 Sales History": sales_history}
     if admin:
         pages.update({"📊 Reports & PDFs": reports, "💹 Income & Expenses": finance_page,
